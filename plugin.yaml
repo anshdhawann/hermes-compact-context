@@ -1,0 +1,12 @@
+name: compact-context
+version: 1.0.0
+description: >
+  ZCode-style aggressive context compression engine for Hermes Agent. Preserves
+  the system prompt and head, summarizes the ENTIRE remaining conversation into
+  a single ~7K structured summary, keeps the recent tail verbatim, and archives
+  the full transcript to disk with a pointer injected into the summary. Mirrors
+  how ZCode's /compact works: one-pass full rewrite instead of incremental
+  trimming by the built-in compressor.
+homepage: https://github.com/anshdhawann/hermes-compact-context
+author: Ansh Dhawan
+kind: standalone

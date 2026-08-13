@@ -1,0 +1,122 @@
+"""Functional test for the ZCode-replica compact-context plugin."""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+from contextlib import contextmanager
+
+REPO = os.environ.get("HERMES_REPO", os.path.expanduser("~/.hermes/hermes-agent"))
+PLUGIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "__init__.py")
+sys.path.insert(0, REPO)
+
+# Capture what the summarizer would receive
+captured_prompt = {}
+
+@contextmanager
+def _noop_protect():
+    yield
+
+class FakeChoice:
+    def __init__(self, content):
+        self.message = type("M", (), {"content": content})()
+
+class FakeResponse:
+    def __init__(self, content):
+        self.choices = [FakeChoice(content)]
+
+def fake_call_llm(**kwargs):
+    captured_prompt["kwargs"] = kwargs
+    return FakeResponse("## Goal\nTest compaction\n## Completed Work\n- did things")
+
+spec = importlib.util.spec_from_file_location("compact_ctx", PLUGIN)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.call_llm = fake_call_llm
+mod.aux_interrupt_protection = _noop_protect
+
+engine = mod.CompactEngine(context_length=1_000_000)
+engine.on_session_start("test-sess-abc")
+engine.transcript_enabled = True
+import tempfile as _tf
+engine.transcript_dir = _tf.mkdtemp(prefix="compact-test-")
+engine.preserve_last_n = 6
+
+# Build a realistic ALTERNATING conversation: system + 3 head exchanges + 8 body turns + 6 tail
+messages = [{"role": "system", "content": "You are Hermes."}]
+messages += [{"role": "user", "content": "head-q0"}]
+messages += [{"role": "assistant", "content": "head-a0"}]
+messages += [{"role": "user", "content": "head-q1"}]
+messages += [{"role": "assistant", "content": f"body-a{i}", "tool_calls": [{"id": f"call_{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]} for i in range(8)]
+messages += [{"role": "tool", "tool_call_id": f"call_{i}", "content": "TOOLOUT" * 2000} for i in range(8)]
+for i in range(3):
+    messages.append({"role": "user", "content": f"tail-q{i}"})
+    messages.append({"role": "assistant", "content": f"tail-a{i}"})
+messages.append({"role": "user", "content": "FINAL USER MESSAGE - continue now"})
+
+orig_count = len(messages)
+result = engine.compress(messages, current_tokens=250_000, focus_topic="grantit pipeline")
+
+print(f"messages: {orig_count} -> {len(result)}")
+roles = [m.get("role") for m in result]
+print("roles:", roles)
+
+# 1. Transcript written + path injected
+transcripts = os.listdir(engine.transcript_dir)
+print("\n[1] transcript files:", transcripts)
+assert len(transcripts) == 1, "transcript not written"
+tpath = os.path.join(engine.transcript_dir, transcripts[0])
+with open(tpath) as f:
+    tlines = f.readlines()
+assert len(tlines) == orig_count, f"transcript has {len(tlines)} lines, expected {orig_count}"
+print(f"    transcript has all {len(tlines)} messages ✓")
+
+# 2. Summary message contains transcript path + resume note + tail note
+summary_msg = next(m for m in result if m.get("_compressed_summary"))
+stext = summary_msg["content"]
+assert tpath in stext, "transcript path missing from summary"
+assert "Pick up the last task as if the break never happened" in stext, "resume note missing"
+assert "Recent messages are preserved verbatim" in stext, "recent-preserved note missing"
+print("[2] summary contains transcript path + resume + preserved-tail notes ✓")
+
+# 3. Tail preserved verbatim — last 6 messages = tail-a0, tail-q1, tail-a1, tail-q2, tail-a2, FINAL
+tail_expect = ["tail-a0", "tail-q1", "tail-a1", "tail-q2", "tail-a2", "FINAL USER MESSAGE - continue now"]
+tail_in_result = [m for m in result if m.get("content") in tail_expect]
+assert len(tail_in_result) == 6, f"tail not fully preserved: {len(tail_in_result)}/6"
+print(f"[3] tail preserved verbatim ({len(tail_in_result)}/6) ✓")
+
+# 4. Head preserved AND no body message leaks into head (head = system + first 3 non-system)
+head_in_result = [m for m in result if m.get("content") in ("head-q0", "head-a0", "head-q1")]
+assert len(head_in_result) == 3, "head not preserved"
+assert not any(m.get("content") == "head-q2" for m in result), "unexpected head-q2"
+leaked = [m for m in result if isinstance(m.get("content"), str) and m["content"].startswith("body-a")]
+assert not leaked, f"head leak: {[m['content'] for m in leaked]}"
+print("[4] head (system + first 3 non-system) preserved, no body leak ✓")
+
+# 5. Final user message present
+assert any(m.get("content") == "FINAL USER MESSAGE - continue now" for m in result), "final user msg missing"
+print("[5] final user message present ✓")
+
+# 6. Prompt is the ZCode 9-section template + focus note + truncated tool marker
+prompt = captured_prompt["kwargs"]["messages"][0]["content"]
+for sec in ["Primary Request and Intent", "Files and Code Sections", "Errors and Fixes",
+            "Security and Constraints", "Current Work", "Optional Next Step",
+            "Respond with TEXT ONLY", "grantit pipeline",
+            "TRUNCATED IN PROMPT"]:
+    assert sec in prompt, f"prompt missing: {sec}"
+print("[6] ZCode 9-section prompt + focus topic + truncation marker ✓")
+
+# 7. Summarizer config passed
+kw = captured_prompt["kwargs"]
+assert kw["task"] == "compression" and kw["max_tokens"] == int(7000 * 1.5)
+print(f"[7] summarizer call: task={kw['task']}, max_tokens={kw['max_tokens']} ✓")
+
+# 8. Strict role alternation across the whole result
+for i in range(1, len(result)):
+    assert result[i]["role"] != result[i-1]["role"], f"role alternation broken at {i}: {result[i-1]['role']} -> {result[i]['role']}"
+print("[8] strict role alternation maintained ✓")
+
+import shutil
+shutil.rmtree(engine.transcript_dir, ignore_errors=True)
+
+print("\nALL CHECKS PASSED ✅")
