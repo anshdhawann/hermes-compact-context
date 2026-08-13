@@ -357,9 +357,9 @@ class CompactEngine(ContextEngine):
         everything else (ZCode /compact replica).
 
         The ``force`` kwarg is accepted for signature parity with the built-in
-        ContextCompressor — the host's manual /compress path passes it. We
-        always summarize when called (manual compression is inherently forced),
-        so the flag is accepted but not gating here.
+        ContextCompressor — the host's manual /compress path passes it. The
+        engine always summarizes when called (manual compression is inherently
+        forced), so the flag is accepted but not gating here.
 
         Returns:
             [system] + [protected head messages] + [summary message] + [recent tail] + [last user message]

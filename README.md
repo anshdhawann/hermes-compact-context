@@ -53,7 +53,7 @@ Trigger tuning: the engine fires at `threshold_percent` of the model's context w
 
 ## Attribution
 
-Inspired by the compaction design of [ZCode](https://zcode.z.ai) (Z.AI) — the best long-session compaction we've used; sessions effectively last forever. This project is an independent, original implementation. It is **not affiliated with, endorsed by, or sponsored by Z.AI / ZCode.**
+Inspired by the compaction design of [ZCode](https://zcode.z.ai) (Z.AI) — the best long-session compaction I've used; sessions effectively last forever. This project is an independent, original implementation. It is **not affiliated with, endorsed by, or sponsored by Z.AI / ZCode.**
 
 See [docs/architecture.md](docs/architecture.md) for the design details and provenance.
 
