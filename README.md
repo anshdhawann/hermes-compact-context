@@ -13,6 +13,7 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 3. **Transcript archive + pointer** — the full pre-compaction conversation is written to JSONL on disk and the path is injected into the summary, so the model can re-read exact details on demand. *Context shrinks; information does not disappear.*
 4. **Verbatim tail** — the last N messages stay untouched.
 5. **Resume semantics** — the model picks up the last task "as if the break never happened."
+6. **Invisible summary** — the summary row is persisted `display_kind="hidden"`: the model sees it in context, every transcript surface renders nothing (ZCode-style: main thread stays clean, full chat lives in the archive).
 
 ## Install
 
@@ -20,7 +21,11 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 bash install.sh   # copies the plugin to ~/.hermes/plugins/compact-context
 
 hermes config set context.engine compact-context
-hermes config set plugins.enabled +compact-context
+# ⚠️ plugins.enabled must be set as a full YAML list — NEVER use '+compact-context'.
+# The '+name' syntax replaces the whole list with a string, which silently
+# disables EVERY plugin (the loader only accepts a list). Keep any plugins
+# you already have enabled:
+hermes config set plugins.enabled '["compact-context"]'
 # /reset to activate
 ```
 
