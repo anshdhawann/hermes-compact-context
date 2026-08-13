@@ -75,6 +75,10 @@ print(f"    transcript has all {len(tlines)} messages ✓")
 summary_msg = next(m for m in result if m.get("_compressed_summary"))
 stext = summary_msg["content"]
 assert tpath in stext, "transcript path missing from summary"
+assert summary_msg.get("display_kind") == "hidden", (
+    "summary must persist display_kind='hidden' (invisible in transcript, "
+    "present in model context)"
+)
 assert "Pick up the last task as if the break never happened" in stext, "resume note missing"
 assert "Recent messages are preserved verbatim" in stext, "recent-preserved note missing"
 print("[2] summary contains transcript path + resume + preserved-tail notes ✓")

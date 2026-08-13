@@ -485,6 +485,13 @@ class CompactEngine(ContextEngine):
             "role": summary_role,
             "content": summary_text,
             COMPRESSED_SUMMARY_METADATA_KEY: True,
+            # Persist the summary invisible in every transcript surface
+            # (the desktop renderer maps display_kind='hidden' to null),
+            # while it stays in the model's context — mirrors ZCode's
+            # "model sees compacted context, UI shows the archive".
+            # archive_and_compact() inserts rows as-is, so this stamp
+            # must live on the dict itself.
+            "display_kind": "hidden",
         })
 
         # Maintain strict role alternation across the compaction boundary.
