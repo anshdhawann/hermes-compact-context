@@ -95,11 +95,39 @@ RESUME_NOTE = (
 
 SUMMARY_END_MARKER = "[END OF FULL COMPACTION SUMMARY]"
 
+# Delimiter used to wrap conversation in prompt - sanitized in formatter so
+# a message containing "---END---" cannot break the prompt structure.
+CONVERSATION_BEGIN_DELIM = "---BEGIN---"
+CONVERSATION_END_DELIM = "---END---"
+
+# Post-summary secret scrub: code-enforced, not just prompt instruction.
+# Matches common secret shapes; replaced with [REDACTED] after LLM returns.
+import re as _re
+_SECRET_PATTERNS = [
+    _re.compile(r'sk-[A-Za-z0-9_-]{20,}'),
+    _re.compile(r'sbp_[A-Za-z0-9]{20,}'),
+    _re.compile(r'gho_[A-Za-z0-9_]{20,}'),
+    _re.compile(r'ghp_[A-Za-z0-9_]{20,}'),
+    _re.compile(r'xox[bprs]-[A-Za-z0-9-]{10,}'),
+    _re.compile(r'AKIA[0-9A-Z]{16}'),
+    _re.compile(r'-----BEGIN (?:RSA )?PRIVATE KEY-----'),
+    _re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\'"][^\'"]{8,}[\'"]'),
+    _re.compile(r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}'),
+]
+
+def _scrub_secrets(s: str) -> str:
+    for pat in _SECRET_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+    return s
+
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 DEFAULT_TARGET_TOKENS = 7000
 DEFAULT_PRESERVE_FIRST_N = 3
 DEFAULT_PRESERVE_LAST_N = 6
+DEFAULT_THRESHOLD_PERCENT = 0.20
+DEFAULT_TRANSCRIPT_RETAIN = 2
+TRANSCRIPT_GLOB = "compaction_transcript_*.jsonl"
 
 # Compaction summary prompt — same design intent and section structure as
 # ZCode's /compact (inspired by its compaction behavior), written in original
@@ -198,6 +226,8 @@ def _format_conversation_for_summary(messages: List[Dict[str, Any]]) -> str:
             )
 
         if content:
+            # Escape prompt delimiters so a message cannot break the prompt structure
+            content = content.replace(CONVERSATION_BEGIN_DELIM, "[BEGIN]").replace(CONVERSATION_END_DELIM, "[END]")
             lines.append(f"{prefix}: {content}")
         else:
             lines.append(prefix)
@@ -210,7 +240,7 @@ def _format_conversation_for_summary(messages: List[Dict[str, Any]]) -> str:
 class CompactEngine(ContextEngine):
     """Context engine that does a ZCode-style full conversation rewrite."""
 
-    threshold_percent: float = 0.20
+    threshold_percent: float = DEFAULT_THRESHOLD_PERCENT
     protect_first_n: int = DEFAULT_PRESERVE_FIRST_N
     protect_last_n: int = 0  # tail handled explicitly via preserve_last_n
 
@@ -236,6 +266,7 @@ class CompactEngine(ContextEngine):
         self.threshold_tokens: int = int(context_length * self.threshold_percent)
         self.context_length: int = context_length
         self.compression_count: int = 0
+        self._consecutive_failures: int = 0
 
         # Dedicated summarizer model/provider (read from config, may be None).
         self._summary_model: Optional[str] = None
@@ -271,6 +302,19 @@ class CompactEngine(ContextEngine):
                 self.preserve_last_n = int(compact_cfg.get("preserve_last_n", DEFAULT_PRESERVE_LAST_N))
                 self.transcript_enabled = bool(compact_cfg.get("transcript_enabled", True))
                 self.transcript_dir = str(compact_cfg.get("transcript_dir", "") or "")
+                # Tunable trigger; was previously a hardcoded class attr (0.20).
+                try:
+                    tp = float(compact_cfg.get("threshold_percent", self.threshold_percent))
+                    if 0.05 <= tp <= 0.95:
+                        self.threshold_percent = tp
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    self.transcript_retain = int(compact_cfg.get("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN))
+                except (TypeError, ValueError):
+                    self.transcript_retain = DEFAULT_TRANSCRIPT_RETAIN
+                # Recompute threshold after config load
+                self.threshold_tokens = int(self.context_length * self.threshold_percent)
                 # Dedicated summarizer model for this engine. If set, it
                 # overrides the main agent's model when summarizing — needed
                 # because the summarizer must read the FULL conversation in
@@ -303,8 +347,17 @@ class CompactEngine(ContextEngine):
             self.last_prompt_tokens + self.last_completion_tokens
         )
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> bool:
+        # Backoff after repeated summarizer failures to avoid spam
+        if self._consecutive_failures >= 3:
+            logger.info("Compact: suppressed by backoff (%d consecutive failures)", self._consecutive_failures)
+            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if tokens <= 0 and messages is not None:
+            try:
+                tokens = estimate_messages_tokens_rough(messages)
+            except Exception:
+                tokens = 0
         if tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
@@ -342,6 +395,34 @@ class CompactEngine(ContextEngine):
         except Exception as e:
             logger.warning("Compact: transcript write failed: %s", e)
             return None
+
+    def _prune_old_transcripts(self, current_path: Optional[str]) -> None:
+        """Keep only the N most recent transcript files."""
+        try:
+            retain = getattr(self, "transcript_retain", DEFAULT_TRANSCRIPT_RETAIN)
+            if retain <= 0:
+                return
+            # Resolve base dir from current_path or config
+            if current_path:
+                base = Path(current_path).parent
+            elif self.transcript_dir:
+                base = Path(self.transcript_dir)
+            elif self._session_id:
+                base = Path.home() / ".hermes" / "sessions" / self._session_id
+            else:
+                base = Path.home() / ".hermes" / "cache" / "compaction_transcripts"
+            if not base.exists():
+                return
+            files = sorted(base.glob(TRANSCRIPT_GLOB), key=lambda p: p.stat().st_mtime)
+            # Keep newest `retain` files
+            for old in files[:-retain]:
+                try:
+                    old.unlink()
+                    logger.info("Compact: pruned old transcript %s", old)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("Compact: transcript prune skipped: %s", e)
 
     # -- Compression ---------------------------------------------------------
 
@@ -392,6 +473,24 @@ class CompactEngine(ContextEngine):
 
         # Archive the FULL conversation before it is summarized away.
         transcript_path = self._write_transcript(messages)
+        if transcript_path:
+            self._prune_old_transcripts(transcript_path)
+
+        # Guard: if body itself exceeds ~80% of context window, summarizing will
+        # fail (summarizer must read full body in one pass). Skip and back off.
+        try:
+            body_tokens_est = estimate_messages_tokens_rough(body)
+            # Use summarizer window if known, else main context_length as proxy
+            # 1M is the advertised summarizer window; cap guard at 800k.
+            guard_limit = int(self.context_length * 0.80)
+            if body_tokens_est > guard_limit:
+                logger.warning(
+                    "Compact: body ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
+                    body_tokens_est, guard_limit, self.context_length,
+                )
+                return messages
+        except Exception:
+            pass
 
         logger.info(
             "Compact triggered (%d tokens >= %d threshold): "
@@ -447,10 +546,15 @@ class CompactEngine(ContextEngine):
             summary = response.choices[0].message.content
             if not summary or not summary.strip():
                 logger.warning("Compact: LLM returned empty summary, keeping messages unchanged")
+                self._consecutive_failures += 1
                 return messages
+            # Code-enforced redaction (prompt says REDACT, but we enforce it)
+            summary = _scrub_secrets(summary)
+            self._consecutive_failures = 0
 
         except Exception as e:
             logger.warning("Compact: LLM summary failed: %s — keeping messages unchanged", e)
+            self._consecutive_failures += 1
             return messages
 
         # Assemble the compressed message list
@@ -609,6 +713,7 @@ class CompactEngine(ContextEngine):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
+        self._consecutive_failures = 0
         self._session_id = None
 
 

@@ -36,14 +36,16 @@ compact-context:
   target_tokens: 7000       # summary size
   preserve_first_n: 3       # head messages kept verbatim
   preserve_last_n: 6        # tail messages kept verbatim
+  threshold_percent: 0.20   # trigger at 20% of context window (~200K on 1M model)
   transcript_enabled: true  # archive + pointer injection
+  transcript_retain: 2      # keep N most recent transcript files (0 = keep all)
   model: zai/GLM-5.2        # dedicated summarizer — MUST fit the full conversation (1M window recommended)
   provider: opencode-go
 ```
 
 **Important:** the summarizer reads the entire conversation in one pass, so its context window must be at least as large as your session. A 1M-context model (e.g. GLM-5.2) is recommended; if the summary call fails, the engine keeps messages unchanged and logs a warning.
 
-Trigger tuning: the engine fires at `threshold_percent` of the model's context window (default 0.20 → fires at ~200K on a 1M-window model). Edit `threshold_percent` in `__init__.py` (class attribute) — the built-in `compression.threshold` config does NOT govern plugin engines.
+Trigger tuning: `compact-context.threshold_percent` (default 0.20 → fires at ~200K on a 1M-window model). The built-in `compression.threshold` config does NOT govern plugin engines.
 
 ## How it compares
 

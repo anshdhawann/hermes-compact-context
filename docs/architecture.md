@@ -13,7 +13,7 @@ session start → on_session_start(session_id)
 after each LLM call → update_from_response(usage)   (tracks prompt/completion tokens)
 each turn → should_compress(prompt_tokens)
   fires when last_prompt_tokens >= threshold_tokens
-  threshold_tokens = context_length × threshold_percent (default 0.20)
+  threshold_tokens = context_length × threshold_percent (default 0.20, configurable via compact-context.threshold_percent)
   → compress(messages, current_tokens, focus_topic)
 session end → on_session_end(session_id, messages)
 ```
@@ -47,6 +47,14 @@ OpenAI-format backends reject adjacent messages with the same role. The summary 
 python3 tests/test_compact_engine.py
 # REPO path: defaults to ~/.hermes/hermes-agent, override with HERMES_REPO
 ```
+
+## Hardening (v2.1)
+- `threshold_percent` is config-driven (was class-attr only).
+- `transcript_retain` keeps the N most recent transcript files (default 2) to bound disk usage.
+- Post-summary secret scrub is code-enforced (sk-*, sbp_*, gho_*, Bearer, private keys, key=value) — not just a prompt instruction.
+- Body-too-large guard (80% of context_length) skips a turn when the body itself would overflow the summarizer.
+- `should_compress` falls back to `estimate_messages_tokens_rough` when the provider omits `prompt_tokens`; backoff after 3 consecutive failures.
+- Prompt delimiters are escaped in message content so `---END---` cannot break the prompt structure.
 
 ## Provenance notes
 
