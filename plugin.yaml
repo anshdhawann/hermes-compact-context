@@ -1,5 +1,5 @@
 name: compact-context
-version: 1.0.0
+version: 2.1.0
 description: >
   ZCode-style aggressive context compression engine for Hermes Agent. Preserves
   the system prompt and head, summarizes the ENTIRE remaining conversation into

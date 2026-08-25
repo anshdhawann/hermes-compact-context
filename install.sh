@@ -23,4 +23,7 @@ echo "  # plugins.enabled must be a full YAML list — NEVER use '+compact-conte
 echo "  # (that replaces the whole list with a string and silently disables every"
 echo "  # plugin). Keep any plugins you already have enabled:"
 echo "  hermes config set plugins.enabled '[\"compact-context\"]'"
+echo "  # REQUIRED: without in_place, rotation mode reloads the full parent"
+echo "  # history in child sessions and re-compresses forever:"
+echo "  hermes config set compression.in_place true"
 echo "  /reset"

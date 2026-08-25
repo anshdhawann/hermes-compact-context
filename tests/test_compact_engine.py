@@ -120,6 +120,42 @@ for i in range(1, len(result)):
     assert result[i]["role"] != result[i-1]["role"], f"role alternation broken at {i}: {result[i-1]['role']} -> {result[i]['role']}"
 print("[8] strict role alternation maintained ✓")
 
+# 9. REGRESSION: head ends with a tool message → summary role is "user";
+#    tail starts with a user message → boundary marker is inserted between
+#    two user-role messages. The marker must flip to "assistant" (a
+#    hardcoded "user" marker produced three consecutive user messages,
+#    which OpenAI-format backends reject).
+messages_b = [{"role": "system", "content": "You are Hermes."}]
+messages_b += [{"role": "user", "content": "headB-q0"}]
+messages_b += [{"role": "assistant", "content": "headB-a0", "tool_calls": [{"id": "call_b0", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}]
+messages_b += [{"role": "tool", "tool_call_id": "call_b0", "content": "headB-tool-out"}]  # head ends with tool
+for i in range(6):
+    messages_b.append({"role": "user", "content": f"bodyB-q{i}"})
+    messages_b.append({"role": "assistant", "content": f"bodyB-a{i}"})
+for i in range(3):
+    messages_b.append({"role": "user", "content": f"tailB-q{i}"})   # tail starts with user
+    messages_b.append({"role": "assistant", "content": f"tailB-a{i}"})
+# session ends on an assistant reply (manual /compress after an exchange) —
+# this makes the last-6 tail start with a user message
+
+engine.transcript_dir = _tf.mkdtemp(prefix="compact-test-b-")
+result_b = engine.compress(messages_b, current_tokens=250_000)
+
+roles_b = [m.get("role") for m in result_b]
+print("\n[9] scenario B roles:", roles_b)
+summary_b = next(m for m in result_b if m.get("_compressed_summary"))
+assert summary_b["role"] == "user", f"scenario B summary should be user-role, got {summary_b['role']}"
+markers_b = [m for m in result_b if isinstance(m.get("content"), str) and m["content"].startswith("[Compaction boundary:")]
+assert len(markers_b) == 1, f"expected 1 boundary marker, got {len(markers_b)}"
+assert markers_b[0]["role"] == "assistant", (
+    f"boundary marker must flip to assistant when summary is user-role; got {markers_b[0]['role']}"
+)
+for i in range(1, len(result_b)):
+    assert result_b[i]["role"] != result_b[i-1]["role"], (
+        f"scenario B role alternation broken at {i}: {result_b[i-1]['role']} -> {result_b[i]['role']}"
+    )
+print("[9] regression: tool-ended head + user-started tail keeps strict alternation ✓")
+
 import shutil
 shutil.rmtree(engine.transcript_dir, ignore_errors=True)
 

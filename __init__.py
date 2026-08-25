@@ -327,9 +327,12 @@ class CompactEngine(ContextEngine):
                     self._summary_provider = cfg_provider
                 logger.info(
                     "Compact engine config: target_tokens=%d, preserve_first_n=%d, "
-                    "preserve_last_n=%d, transcript_enabled=%s, "
+                    "preserve_last_n=%d, threshold_percent=%.2f (fires at %d tokens), "
+                    "transcript_enabled=%s, "
                     "summary_model=%s, summary_provider=%s",
-                    self.target_tokens, self.protect_first_n, self.preserve_last_n,
+                    self.target_tokens, self.protect_first_n,
+                    self.preserve_last_n, self.threshold_percent,
+                    self.threshold_tokens,
                     self.transcript_enabled,
                     self._summary_model, self._summary_provider,
                 )
@@ -612,7 +615,10 @@ class CompactEngine(ContextEngine):
             _next_role = (tail[0].get("role") if tail else None) or (last_user_msg.get("role") if last_user_msg else None)
             if _next_role == summary_role:
                 compressed.append({
-                    "role": "user",
+                    # The marker sits between the summary and the next message,
+                    # both of which carry summary_role — so the marker must take
+                    # the OPPOSITE role, or the API sees three same-role messages.
+                    "role": "assistant" if summary_role == "user" else "user",
                     "content": (
                         "[Compaction boundary: the summary above replaces the earlier "
                         "conversation; the messages below are preserved recent history. "

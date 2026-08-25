@@ -26,6 +26,11 @@ hermes config set context.engine compact-context
 # disables EVERY plugin (the loader only accepts a list). Keep any plugins
 # you already have enabled:
 hermes config set plugins.enabled '["compact-context"]'
+# ⚠️ REQUIRED: persist compacted messages in the SAME session. Without this,
+# Hermes rotation mode spawns a child session that reloads the FULL parent
+# history, re-triggers compression, and loops forever ("No changes from
+# compression" every turn, tokens never shrink):
+hermes config set compression.in_place true
 # /reset to activate
 ```
 
@@ -41,6 +46,8 @@ compact-context:
   transcript_retain: 2      # keep N most recent transcript files (0 = keep all)
   model: zai/GLM-5.2        # dedicated summarizer — MUST fit the full conversation (1M window recommended)
   provider: opencode-go
+compression:
+  in_place: true            # REQUIRED — see Install
 ```
 
 **Important:** the summarizer reads the entire conversation in one pass, so its context window must be at least as large as your session. A 1M-context model (e.g. GLM-5.2) is recommended; if the summary call fails, the engine keeps messages unchanged and logs a warning.
