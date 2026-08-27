@@ -10,11 +10,11 @@ v2 (ZCode /compact replica):
    not disappear — it moves to retrievable storage (ZCode behaviour).
 
 2. **ZCode-grade summary prompt** — chronological <analysis> pass over every
-   message, then a 9-section <summary>: Primary Request & Intent, Key
+   message, then a 10-section <summary>: Primary Request & Intent, Key
    Technical Concepts, Files & Code Sections (full snippets), Errors & Fixes,
-   User Preferences & Corrections, Security & Constraints (VERBATIM),
-   Key Decisions & Rationale, Current Work, Optional Next Step. Text-only,
-   no tools, one shot.
+   User Preferences & Corrections, All user messages (verbatim), Security &
+   Constraints (VERBATIM), Key Decisions & Rationale, Current Work, Optional
+   Next Step. Text-only, no tools, one shot.
 
 3. **Tail preservation** — the last N messages stay verbatim after the
    summary (ZCode: "Recent messages are preserved verbatim.").
@@ -162,10 +162,11 @@ SUMMARY SECTIONS
 3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable, with a summary of why each file read or edit is important.
 4. Errors and Fixes: List every error encountered, the exact error message or signature, and how it was diagnosed and fixed.
 5. User Preferences and Corrections: Every explicit preference, style rule, or correction the user stated — preserved verbatim where stated as rules.
-6. Security and Constraints: Every security-relevant instruction or constraint the user stated — preserved VERBATIM so they continue to apply after compaction.
-7. Key Decisions and Rationale: Technical decisions, architecture choices, and tool selections, with the reasoning given.
-8. Current Work: Precise description of the work currently in progress, including exact file paths and the last known state.
-9. Optional Next Step: The single most likely next step to continue the work.
+6. All user messages: Every user message in order — verbatim when short, condensed to its operative request when long. The user's own voice must survive compaction.
+7. Security and Constraints: Every security-relevant instruction or constraint the user stated — preserved VERBATIM so they continue to apply after compaction.
+8. Key Decisions and Rationale: Technical decisions, architecture choices, and tool selections, with the reasoning given.
+9. Current Work: Precise description of the work currently in progress, with exact file paths and the last known state.
+10. Optional Next Step: The single most likely next step to continue the work.
 
 OUTPUT CONSTRAINTS
 - Target: ~{target_tokens} tokens

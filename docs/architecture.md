@@ -28,7 +28,7 @@ The host persists the compacted message list ONLY when `compression.in_place: tr
 
 1. **Boundaries** — `head` = system prompt + first `preserve_first_n` non-system messages; `tail` = last `preserve_last_n` messages; `body` = everything between.
 2. **Transcript archive** — the FULL message list (head + body + tail, tool outputs included) is written as JSONL to `~/.hermes/sessions/<id>/compaction_transcript_<ts>.jsonl` (or `compact-context.transcript_dir` override). The path is injected into the summary message.
-3. **Summarization prompt** — body messages are formatted as a dense text transcript (tool outputs >4K chars truncated with a marker pointing at the on-disk transcript). The prompt requests an `<analysis>` + `<summary>` reply with 9 sections. `focus_topic` (from `/compress [topic]`) is forwarded and prioritized.
+3. **Summarization prompt** — body messages are formatted as a dense text transcript (tool outputs >4K chars truncated with a marker pointing at the on-disk transcript). The prompt requests an `<analysis>` + `<summary>` reply with 10 sections (ZCode's nine minus its Problem Solving/Pending Tasks, plus User Preferences, Security and Constraints, Key Decisions — and, since v2.2, ZCode's "All user messages" so the user's voice survives verbatim). `focus_topic` (from `/compress [topic]`) is forwarded and prioritized.
 4. **Summary call** — routed via `call_llm(task="compression")`; a dedicated summarizer model (config `compact-context.model`/`provider`) overrides the main runtime when set. `max_tokens = target_tokens × 1.5`. On any failure the engine returns messages unchanged (graceful degradation).
 5. **Assembly** — `[system+note] [head] [summary message] [tail] [last user message]`. The summary role is chosen to avoid consecutive same-role messages; if the message after the summary would repeat the summary's role, a synthetic boundary marker is inserted with the OPPOSITE role of the summary (not hardcoded — a hardcoded `user` marker produced three consecutive user messages whenever the summary itself was user-role). Orphaned `tool` messages (no active `tool_call_id`) are filtered.
 6. **Metadata** — the summary message is marked `_compressed_summary: true` (underscore keys are stripped by wire sanitizers before reaching the API).
@@ -45,7 +45,7 @@ OpenAI-format backends reject adjacent messages with the same role. The summary 
 
 ## Testing
 
-`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 9-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, and a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`).
+`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 10-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, and a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`).
 
 ```bash
 python3 tests/test_compact_engine.py
@@ -63,5 +63,7 @@ python3 tests/test_compact_engine.py
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).
-- Observed-but-unverified: live end-to-end capture of a post-compaction context (pointer line present in the app, not captured from a live session on record).
+- VERIFIED against live ZCode artifacts (2026-08-26: a 2026-07-03 compaction summary recovered from ZCode's own session database, plus a live continued session): full-rewrite summary, numbered-section format, delivery as a **user-role message**, preserved recent tail, and an append-only store that never deletes old turns — all confirmed.
+- Two deliberate Hermes-specific divergences: **(1)** ZCode does NOT inject a transcript pointer into the summary — the pointer here is our extension, the Hermes-native way to give the model re-read access (ZCode's own store serves that role internally). **(2)** ZCode never prunes its store; our `transcript_retain: 2` pruning is safe because Hermes' `in_place` soft-archive already retains every pre-compaction turn in the session database.
+- ZCode's section list (Problem Solving / All user messages / Pending Tasks) differs from ours in 3 of 9 slots; v2.2 adopts ZCode's "All user messages" verbatim-voice section.
 - ZCode is closed-source and evolving; its compaction may change between versions. This engine replicates the design as of the version noted above.

@@ -104,7 +104,7 @@ print("[5] final user message present ✓")
 # 6. Prompt is the ZCode 9-section template + focus note + truncated tool marker
 prompt = captured_prompt["kwargs"]["messages"][0]["content"]
 for sec in ["Primary Request and Intent", "Files and Code Sections", "Errors and Fixes",
-            "Security and Constraints", "Current Work", "Optional Next Step",
+            "Security and Constraints", "All user messages", "Current Work", "Optional Next Step",
             "Respond with TEXT ONLY", "grantit pipeline",
             "TRUNCATED IN PROMPT"]:
     assert sec in prompt, f"prompt missing: {sec}"
