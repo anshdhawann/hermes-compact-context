@@ -13,8 +13,9 @@ session start → on_session_start(session_id)
 after each LLM call → update_from_response(usage)   (tracks prompt/completion tokens)
 each turn → should_compress(prompt_tokens)
   fires when last_prompt_tokens >= threshold_tokens
-  threshold_tokens = threshold_tokens_cfg (fixed, compact-context.threshold_tokens)
-                  or context_length × threshold_percent (default 0.20, compact-context.threshold_percent)
+  threshold_tokens = min(threshold_tokens_cfg, context_length × threshold_percent)  when both are explicitly configured
+                  | threshold_tokens_cfg (fixed, compact-context.threshold_tokens)
+                  | context_length × threshold_percent (default 0.20, compact-context.threshold_percent)
   → compress(messages, current_tokens, focus_topic)
 session end → on_session_end(session_id, messages)
 ```
@@ -40,7 +41,7 @@ OpenAI-format backends reject adjacent messages with the same role. The summary 
 
 ## Token accounting
 
-- Threshold resolution lives in `_recompute_threshold()`, run at init, config load, and every `update_model()`: a fixed `threshold_tokens` (> 0, from `compact-context.threshold_tokens`) overrides the percent rule; a fixed value ≥ 95% of the window can never fire before overflow, so it falls back to percent with a warning. Re-checked per model switch because the window can change under a fixed value.
+- Threshold resolution lives in `_recompute_threshold()`, run at init, config load, and every `update_model()`: a fixed `threshold_tokens` (> 0, from `compact-context.threshold_tokens`) overrides the percent rule; when **both** are explicitly configured they compose as **min(fixed, percent×window)** — an explicit percent is one that was present and valid (0.05–0.95) in config, tracked via `_explicit_percent`, so a fixed-only setup is never capped by the default percent. min() is always under 95% of the window, so it can't trip the overflow guard; a fixed-only value ≥ 95% of the window can never fire before overflow, so it falls back to percent with a warning. Re-checked per model switch because the window can change under a fixed value.
 - `should_compress()` compares `last_prompt_tokens` (from provider usage). If the provider omits `prompt_tokens`, compression never fires.
 - `compression.threshold` in config.yaml governs ONLY the built-in compressor, not this engine.
 

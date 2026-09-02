@@ -159,8 +159,11 @@ print("[9] regression: tool-ended head + user-started tail keeps strict alternat
 import shutil
 shutil.rmtree(engine.transcript_dir, ignore_errors=True)
 
-# 10. Fixed threshold_tokens overrides the percent rule
+# 10. Fixed threshold_tokens overrides the percent rule (fixed-ONLY mode:
+# pin _explicit_percent off so ambient ~/.hermes/config.yaml can't flip us
+# into min() composition)
 e2 = mod.CompactEngine(context_length=200_000)
+e2._explicit_percent = False
 pct_default = e2.threshold_tokens  # percent-derived, whatever config says
 e2.threshold_tokens_cfg = 150_000
 e2._recompute_threshold()
@@ -186,5 +189,26 @@ e2.context_length = 1_000_000
 e2._recompute_threshold()
 assert e2.threshold_tokens == 150_000, "fixed 150K valid again on 1M window"
 print("[11] oversized/outgrown fixed threshold safely falls back to percent ✓")
+
+# 12. Both knobs explicitly set -> compose as min(): ride the percent, capped by the fixed
+# (user formula: min(0.8 * context_length, 200K))
+e2.threshold_percent = 0.8
+e2._explicit_percent = True
+e2.threshold_tokens_cfg = 200_000
+e2.context_length = 1_000_000
+e2._recompute_threshold()
+assert e2.threshold_tokens == 200_000, f"big window: fixed cap should win, got {e2.threshold_tokens}"
+e2.context_length = 200_000  # 0.8*200K = 160K < 200K cap
+e2._recompute_threshold()
+assert e2.threshold_tokens == 160_000, f"small window: percent should win, got {e2.threshold_tokens}"
+e2.context_length = 128_000  # 0.8*128K = 102.4K -- min() can never trip the 95% guard
+e2._recompute_threshold()
+assert e2.threshold_tokens == 102_400, f"tiny window: expected 102400, got {e2.threshold_tokens}"
+# fixed-only mode (no explicit percent) is unchanged: v2.3.0 semantics
+e2._explicit_percent = False
+e2.context_length = 1_000_000
+e2._recompute_threshold()
+assert e2.threshold_tokens == 200_000, "fixed-only must not be capped by a non-explicit percent"
+print("[12] both-set composes as min(); fixed-only semantics unchanged ✓")
 
 print("\nALL CHECKS PASSED ✅")

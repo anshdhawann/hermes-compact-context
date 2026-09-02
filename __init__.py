@@ -267,6 +267,7 @@ class CompactEngine(ContextEngine):
         self.last_total_tokens: int = 0
         self.threshold_tokens: int = 0
         self.threshold_tokens_cfg: int = DEFAULT_THRESHOLD_TOKENS
+        self._explicit_percent: bool = False
         self.context_length: int = context_length
         self.compression_count: int = 0
         self._consecutive_failures: int = 0
@@ -290,13 +291,20 @@ class CompactEngine(ContextEngine):
     def _recompute_threshold(self) -> None:
         """Resolve the effective fire threshold.
 
-        A fixed ``threshold_tokens`` config beats ``threshold_percent``.
-        It must stay under 95% of the context window, else it could never
-        fire before overflow — in that case fall back to the percent rule
-        (re-checked on every model switch, since the window can change).
+        Fixed beats percent. When BOTH are explicitly configured they
+        compose as min() — ride the percent, never past the fixed cap;
+        min() is always under 95% of the window (percent is validated to
+        0.05-0.95), so the overflow guard below cannot trigger for it.
+        A fixed-only value must stay under 95% of the context window,
+        else it could never fire before overflow — in that case fall
+        back to the percent rule (re-checked on every model switch,
+        since the window can change).
         """
         cfg = self.threshold_tokens_cfg
-        if 0 < cfg < self.context_length * 0.95:
+        pct = int(self.context_length * self.threshold_percent)
+        if cfg > 0 and self._explicit_percent:
+            self.threshold_tokens = min(cfg, pct)
+        elif 0 < cfg < self.context_length * 0.95:
             self.threshold_tokens = cfg
         else:
             if cfg > 0:
@@ -305,7 +313,7 @@ class CompactEngine(ContextEngine):
                     "falling back to threshold_percent=%.2f",
                     cfg, self.context_length, self.threshold_percent,
                 )
-            self.threshold_tokens = int(self.context_length * self.threshold_percent)
+            self.threshold_tokens = pct
 
     def _load_config(self):
         """Read compact-context-specific config from config.yaml.
@@ -328,10 +336,14 @@ class CompactEngine(ContextEngine):
                 self.transcript_enabled = bool(compact_cfg.get("transcript_enabled", True))
                 self.transcript_dir = str(compact_cfg.get("transcript_dir", "") or "")
                 # Tunable trigger; was previously a hardcoded class attr (0.20).
+                # Validity also marks it explicit, which switches a fixed
+                # threshold into min(fixed, percent) composition downstream.
+                self._explicit_percent = False
                 try:
                     tp = float(compact_cfg.get("threshold_percent", self.threshold_percent))
                     if 0.05 <= tp <= 0.95:
                         self.threshold_percent = tp
+                        self._explicit_percent = True
                 except (TypeError, ValueError):
                     pass
                 try:
