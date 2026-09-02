@@ -9,7 +9,7 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 ## How it works
 
 1. **Full rewrite** — the whole conversation is summarized in one pass by a dedicated large-context model. No protected middle, no iterative re-compression.
-2. **10-section handoff summary** — chronological analysis over every message: requests & intent, technical concepts, files & full code snippets, errors & fixes, user preferences, security constraints (preserved VERBATIM), key decisions, current work, optional next step.
+2. **10-section handoff summary** — chronological analysis over every message: requests & intent, technical concepts, files & full code snippets, errors & fixes, user preferences, all user messages (verbatim), security constraints (preserved VERBATIM), key decisions, current work, optional next step.
 3. **Transcript archive + pointer** — the full pre-compaction conversation is written to JSONL on disk and the path is injected into the summary, so the model can re-read exact details on demand. *Context shrinks; information does not disappear.*
 4. **Verbatim tail** — the last N messages stay untouched.
 5. **Resume semantics** — the model picks up the last task "as if the break never happened."
