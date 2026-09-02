@@ -101,14 +101,14 @@ print("[4] head (system + first 3 non-system) preserved, no body leak ✓")
 assert any(m.get("content") == "FINAL USER MESSAGE - continue now" for m in result), "final user msg missing"
 print("[5] final user message present ✓")
 
-# 6. Prompt is the ZCode 9-section template + focus note + truncated tool marker
+# 6. Prompt is the ZCode 10-section template + focus note + truncated tool marker
 prompt = captured_prompt["kwargs"]["messages"][0]["content"]
 for sec in ["Primary Request and Intent", "Files and Code Sections", "Errors and Fixes",
             "Security and Constraints", "All user messages", "Current Work", "Optional Next Step",
             "Respond with TEXT ONLY", "grantit pipeline",
             "TRUNCATED IN PROMPT"]:
     assert sec in prompt, f"prompt missing: {sec}"
-print("[6] ZCode 9-section prompt + focus topic + truncation marker ✓")
+print("[6] ZCode 10-section prompt + focus topic + truncation marker ✓")
 
 # 7. Summarizer config passed
 kw = captured_prompt["kwargs"]
@@ -158,5 +158,33 @@ print("[9] regression: tool-ended head + user-started tail keeps strict alternat
 
 import shutil
 shutil.rmtree(engine.transcript_dir, ignore_errors=True)
+
+# 10. Fixed threshold_tokens overrides the percent rule
+e2 = mod.CompactEngine(context_length=200_000)
+pct_default = e2.threshold_tokens  # percent-derived, whatever config says
+e2.threshold_tokens_cfg = 150_000
+e2._recompute_threshold()
+assert e2.threshold_tokens == 150_000, f"fixed override ignored: {e2.threshold_tokens}"
+assert e2.should_compress(prompt_tokens=150_000) is True
+assert e2.should_compress(prompt_tokens=149_999) is False
+print(f"\n[10] fixed threshold: fires at exactly 150K (percent rule would be {pct_default}) ✓")
+
+# 11. Fixed value too big for the window falls back to percent (re-checked on
+# every recompute, i.e. every model switch — the window can change under a fixed value)
+e2.threshold_tokens_cfg = 195_000  # >= 0.95 * 200K
+e2._recompute_threshold()
+assert e2.threshold_tokens == pct_default, (
+    f"oversized fixed threshold should fall back to percent ({pct_default}), got {e2.threshold_tokens}"
+)
+e2.threshold_tokens_cfg = 150_000
+e2.context_length = 128_000  # switch to a window the fixed value no longer fits
+e2._recompute_threshold()
+assert e2.threshold_tokens == int(128_000 * e2.threshold_percent), (
+    "fixed 150K invalid on 128K window — should re-derive from percent"
+)
+e2.context_length = 1_000_000
+e2._recompute_threshold()
+assert e2.threshold_tokens == 150_000, "fixed 150K valid again on 1M window"
+print("[11] oversized/outgrown fixed threshold safely falls back to percent ✓")
 
 print("\nALL CHECKS PASSED ✅")

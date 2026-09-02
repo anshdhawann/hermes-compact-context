@@ -13,7 +13,8 @@ session start → on_session_start(session_id)
 after each LLM call → update_from_response(usage)   (tracks prompt/completion tokens)
 each turn → should_compress(prompt_tokens)
   fires when last_prompt_tokens >= threshold_tokens
-  threshold_tokens = context_length × threshold_percent (default 0.20, configurable via compact-context.threshold_percent)
+  threshold_tokens = threshold_tokens_cfg (fixed, compact-context.threshold_tokens)
+                  or context_length × threshold_percent (default 0.20, compact-context.threshold_percent)
   → compress(messages, current_tokens, focus_topic)
 session end → on_session_end(session_id, messages)
 ```
@@ -39,13 +40,13 @@ OpenAI-format backends reject adjacent messages with the same role. The summary 
 
 ## Token accounting
 
-- `update_model()` recomputes `threshold_tokens = context_length × threshold_percent` on every model switch — `threshold_percent` is config-readable (`compact-context.threshold_percent`, default 0.20), so the percent is the single governing knob.
+- Threshold resolution lives in `_recompute_threshold()`, run at init, config load, and every `update_model()`: a fixed `threshold_tokens` (> 0, from `compact-context.threshold_tokens`) overrides the percent rule; a fixed value ≥ 95% of the window can never fire before overflow, so it falls back to percent with a warning. Re-checked per model switch because the window can change under a fixed value.
 - `should_compress()` compares `last_prompt_tokens` (from provider usage). If the provider omits `prompt_tokens`, compression never fires.
 - `compression.threshold` in config.yaml governs ONLY the built-in compressor, not this engine.
 
 ## Testing
 
-`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 10-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, and a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`).
+`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 10-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`), and the fixed/percent threshold modes (fixed fires at exactly N; oversized or outgrown fixed values fall back to percent).
 
 ```bash
 python3 tests/test_compact_engine.py

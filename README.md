@@ -42,6 +42,7 @@ compact-context:
   preserve_first_n: 3       # head messages kept verbatim
   preserve_last_n: 6        # tail messages kept verbatim
   threshold_percent: 0.20   # trigger at 20% of context window (~200K on 1M model)
+  threshold_tokens: 0       # fixed trigger in tokens; >0 overrides threshold_percent (e.g. 200000)
   transcript_enabled: true  # archive + pointer injection
   transcript_retain: 2      # keep N most recent transcript files (0 = keep all)
   model: zai/GLM-5.2        # dedicated summarizer — MUST fit the full conversation (1M window recommended)
@@ -52,7 +53,7 @@ compression:
 
 **Important:** the summarizer reads the entire conversation in one pass, so its context window must be at least as large as your session. A 1M-context model (e.g. GLM-5.2) is recommended; if the summary call fails, the engine keeps messages unchanged and logs a warning.
 
-Trigger tuning: `compact-context.threshold_percent` (default 0.20 → fires at ~200K on a 1M-window model). The built-in `compression.threshold` config does NOT govern plugin engines.
+Trigger tuning: two modes — relative (`threshold_percent`, default 0.20 → fires at ~200K on a 1M-window model) or fixed (`threshold_tokens: 200000` fires at exactly 200K regardless of window; overrides the percent when > 0). A fixed value ≥ 95% of the context window can never fire in time, so it's ignored with a warning and the percent rule is used instead — re-checked on every model switch, since the window can change. The built-in `compression.threshold` config does NOT govern plugin engines.
 
 ## How it compares
 

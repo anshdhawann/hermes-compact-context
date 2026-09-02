@@ -126,6 +126,7 @@ DEFAULT_TARGET_TOKENS = 7000
 DEFAULT_PRESERVE_FIRST_N = 3
 DEFAULT_PRESERVE_LAST_N = 6
 DEFAULT_THRESHOLD_PERCENT = 0.20
+DEFAULT_THRESHOLD_TOKENS = 0  # 0 = off; derive from threshold_percent instead
 DEFAULT_TRANSCRIPT_RETAIN = 2
 TRANSCRIPT_GLOB = "compaction_transcript_*.jsonl"
 
@@ -264,7 +265,8 @@ class CompactEngine(ContextEngine):
         self.last_prompt_tokens: int = 0
         self.last_completion_tokens: int = 0
         self.last_total_tokens: int = 0
-        self.threshold_tokens: int = int(context_length * self.threshold_percent)
+        self.threshold_tokens: int = 0
+        self.threshold_tokens_cfg: int = DEFAULT_THRESHOLD_TOKENS
         self.context_length: int = context_length
         self.compression_count: int = 0
         self._consecutive_failures: int = 0
@@ -281,7 +283,29 @@ class CompactEngine(ContextEngine):
         # Read compact config
         self.target_tokens: int = DEFAULT_TARGET_TOKENS
         self.preserve_last_n: int = DEFAULT_PRESERVE_LAST_N
+        # Sane default even if _load_config fails (hermes_cli missing):
+        self._recompute_threshold()
         self._load_config()
+
+    def _recompute_threshold(self) -> None:
+        """Resolve the effective fire threshold.
+
+        A fixed ``threshold_tokens`` config beats ``threshold_percent``.
+        It must stay under 95% of the context window, else it could never
+        fire before overflow — in that case fall back to the percent rule
+        (re-checked on every model switch, since the window can change).
+        """
+        cfg = self.threshold_tokens_cfg
+        if 0 < cfg < self.context_length * 0.95:
+            self.threshold_tokens = cfg
+        else:
+            if cfg > 0:
+                logger.warning(
+                    "threshold_tokens=%d >= 95%% of context window (%d); "
+                    "falling back to threshold_percent=%.2f",
+                    cfg, self.context_length, self.threshold_percent,
+                )
+            self.threshold_tokens = int(self.context_length * self.threshold_percent)
 
     def _load_config(self):
         """Read compact-context-specific config from config.yaml.
@@ -314,8 +338,14 @@ class CompactEngine(ContextEngine):
                     self.transcript_retain = int(compact_cfg.get("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN))
                 except (TypeError, ValueError):
                     self.transcript_retain = DEFAULT_TRANSCRIPT_RETAIN
+                # Fixed trigger: absolute token count that overrides the
+                # percent rule (0 = off). Validated in _recompute_threshold.
+                try:
+                    self.threshold_tokens_cfg = int(compact_cfg.get("threshold_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    self.threshold_tokens_cfg = 0
                 # Recompute threshold after config load
-                self.threshold_tokens = int(self.context_length * self.threshold_percent)
+                self._recompute_threshold()
                 # Dedicated summarizer model for this engine. If set, it
                 # overrides the main agent's model when summarizing — needed
                 # because the summarizer must read the FULL conversation in
@@ -328,11 +358,13 @@ class CompactEngine(ContextEngine):
                     self._summary_provider = cfg_provider
                 logger.info(
                     "Compact engine config: target_tokens=%d, preserve_first_n=%d, "
-                    "preserve_last_n=%d, threshold_percent=%.2f (fires at %d tokens), "
+                    "preserve_last_n=%d, threshold_percent=%.2f, threshold_tokens_cfg=%d "
+                    "(fires at %d tokens), "
                     "transcript_enabled=%s, "
                     "summary_model=%s, summary_provider=%s",
                     self.target_tokens, self.protect_first_n,
                     self.preserve_last_n, self.threshold_percent,
+                    self.threshold_tokens_cfg,
                     self.threshold_tokens,
                     self.transcript_enabled,
                     self._summary_model, self._summary_provider,
@@ -705,7 +737,6 @@ class CompactEngine(ContextEngine):
         self._api_key = api_key
         self._api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = int(context_length * self.threshold_percent)
         self._load_config()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
