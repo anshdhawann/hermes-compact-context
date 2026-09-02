@@ -110,7 +110,10 @@ _SECRET_PATTERNS = [
     _re.compile(r'ghp_[A-Za-z0-9_]{20,}'),
     _re.compile(r'xox[bprs]-[A-Za-z0-9-]{10,}'),
     _re.compile(r'AKIA[0-9A-Z]{16}'),
-    _re.compile(r'-----BEGIN (?:RSA )?PRIVATE KEY-----'),
+    # Full block (header through footer) for any key type: RSA, EC, DSA,
+    # OPENSSH, ENCRYPTED. The optional-footer form still redacts the header
+    # alone when a block is truncated mid-key.
+    _re.compile(r"-----BEGIN [A-Z0-9_-]+ PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9_-]+ PRIVATE KEY-----)?"),
     _re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\'"][^\'"]{8,}[\'"]'),
     _re.compile(r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}'),
 ]
@@ -217,8 +220,16 @@ def _format_conversation_for_summary(messages: List[Dict[str, Any]]) -> str:
         prefix = f"[{i}] {role.upper()}"
         tool_calls = msg.get("tool_calls")
         if role == "assistant" and tool_calls:
-            tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-            prefix += f" [tool_call: {', '.join(tool_names)}]"
+            # Include a short argument preview: file paths and commands are
+            # what the summary's "Files and Code Sections" / "Errors and
+            # Fixes" sections are built from — names alone starve them.
+            call_strs = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "") or ""
+                preview = args[:200] + "…" if len(args) > 200 else args
+                call_strs.append(f"{fn.get('name', '?')}({preview})")
+            prefix += f" [tool_call: {', '.join(call_strs)}]"
 
         if role == "tool" and len(content) > 4000:
             content = (
@@ -336,16 +347,20 @@ class CompactEngine(ContextEngine):
                 self.transcript_enabled = bool(compact_cfg.get("transcript_enabled", True))
                 self.transcript_dir = str(compact_cfg.get("transcript_dir", "") or "")
                 # Tunable trigger; was previously a hardcoded class attr (0.20).
-                # Validity also marks it explicit, which switches a fixed
-                # threshold into min(fixed, percent) composition downstream.
+                # Explicit = key present AND valid (0.05-0.95). The membership
+                # check matters: get()'s default (0.20) also passes the range
+                # check, which used to mark the percent "explicit" on every
+                # config load and silently cap fixed-only thresholds to
+                # min(fixed, 20% of window).
                 self._explicit_percent = False
-                try:
-                    tp = float(compact_cfg.get("threshold_percent", self.threshold_percent))
-                    if 0.05 <= tp <= 0.95:
-                        self.threshold_percent = tp
-                        self._explicit_percent = True
-                except (TypeError, ValueError):
-                    pass
+                if "threshold_percent" in compact_cfg:
+                    try:
+                        tp = float(compact_cfg["threshold_percent"])
+                        if 0.05 <= tp <= 0.95:
+                            self.threshold_percent = tp
+                            self._explicit_percent = True
+                    except (TypeError, ValueError):
+                        pass
                 try:
                     self.transcript_retain = int(compact_cfg.get("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN))
                 except (TypeError, ValueError):
@@ -396,8 +411,12 @@ class CompactEngine(ContextEngine):
         )
 
     def should_compress(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> bool:
-        # Backoff after repeated summarizer failures to avoid spam
-        if self._consecutive_failures >= 3:
+        # Backoff after repeated summarizer failures to avoid spam — but
+        # probe every 5th turn instead of dying for the rest of the session:
+        # while suppressed, compress() never runs, so nothing but a probe
+        # can ever reset the counter.
+        if self._consecutive_failures >= 3 and self._consecutive_failures % 5 != 0:
+            self._consecutive_failures += 1
             logger.info("Compact: suppressed by backoff (%d consecutive failures)", self._consecutive_failures)
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -514,6 +533,18 @@ class CompactEngine(ContextEngine):
 
         head = messages[:head_size]
         body = messages[head_size:body_end] if body_end is not None else messages[head_size:]
+
+        # Repair tool pairing across the head/tail boundary BEFORE assembly:
+        # (a) a tail tool whose calling assistant was summarized into the body
+        # must not influence the boundary-marker decision and only then get
+        # deleted (that left the summary adjacent to a same-role message —
+        # 400), and (b) a head assistant whose tool results fell into the body
+        # must lose those calls here (unanswered tool_calls — 400). A tool in
+        # head always has its parent assistant before it in head, so head
+        # never loses messages; only tail can (plus stripped calls).
+        if tail:
+            repaired = self._sanitize_tool_pairs(head + tail)
+            head, tail = repaired[:len(head)], repaired[len(head):]
 
         if not body:
             logger.info("Compact: nothing to summarize (only head+tail), skipping")
@@ -676,14 +707,19 @@ class CompactEngine(ContextEngine):
             if tm not in head:
                 compressed.append(tm.copy())
 
-        # Append the last user message (if not already in head or tail)
+        # Append the last user message only when it repairs the list or the
+        # session genuinely ends on it. After an assistant answer it would
+        # read as a fresh re-ask of an already-completed task; ending on the
+        # assistant's reply is valid and lets the model continue instead.
+        # (tail ending on a dangling tool MUST still get the append — a bare
+        # trailing tool message is a protocol 400.)
         if last_user_msg is not None and last_user_msg not in head and last_user_msg not in tail:
-            compressed.append(last_user_msg.copy())
+            tail_end_role = tail[-1].get("role") if tail else None
+            session_ends_on_user = bool(messages) and messages[-1] is last_user_msg
+            if session_ends_on_user or tail_end_role in (None, "tool"):
+                compressed.append(last_user_msg.copy())
 
         self.compression_count += 1
-
-        # Sanitize orphaned tool pairs
-        compressed = self._sanitize_tool_pairs(compressed)
 
         logger.info(
             "Compact complete: %d messages -> %d messages (%.1f%% reduction)",
@@ -716,22 +752,35 @@ class CompactEngine(ContextEngine):
 
     @staticmethod
     def _sanitize_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove orphaned tool messages whose tool_call_id has no parent."""
-        active_call_ids = set()
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    cid = tc.get("id", "")
-                    if cid:
-                        active_call_ids.add(cid)
+        """Repair tool pairing in BOTH directions.
 
+        Drops tool messages whose calling assistant is absent, and strips
+        tool_calls from assistants whose tool results are absent (partial
+        parallel-call splits included). Either shape left in the list is an
+        immediate 400 on OpenAI-format backends. An assistant left with no
+        calls and no content gets a placeholder so it stays a valid message.
+        """
+        answered_call_ids = {
+            m.get("tool_call_id") for m in messages
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+        active_call_ids = set()  # call ids still referenced by a kept assistant
         cleaned = []
         for msg in messages:
-            if msg.get("role") == "tool":
-                tid = msg.get("tool_call_id", "")
-                if tid and tid not in active_call_ids:
+            m = msg.copy()
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                valid_calls = [tc for tc in m["tool_calls"] if tc.get("id") in answered_call_ids]
+                if valid_calls:
+                    m["tool_calls"] = valid_calls
+                    active_call_ids.update(tc.get("id") for tc in valid_calls)
+                else:
+                    m.pop("tool_calls", None)
+                    if not m.get("content"):
+                        m["content"] = "[Completed earlier actions]"
+            elif m.get("role") == "tool":
+                if m.get("tool_call_id") not in active_call_ids:
                     continue
-            cleaned.append(msg)
+            cleaned.append(m)
         return cleaned
 
     def update_model(
@@ -748,6 +797,9 @@ class CompactEngine(ContextEngine):
         self._base_url = base_url
         self._api_key = api_key
         self._api_mode = api_mode
+        # A model switch is a fresh summarizer config — give it a fresh
+        # backoff state instead of staying suppressed from the old one.
+        self._consecutive_failures = 0
         self.context_length = context_length
         self._load_config()
 

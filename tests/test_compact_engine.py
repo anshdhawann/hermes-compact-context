@@ -17,6 +17,40 @@ captured_prompt = {}
 def _noop_protect():
     yield
 
+# Portable + deterministic environment, installed BEFORE the plugin loads:
+# 1) If no Hermes install exists (CI, contributor machines), stub the three
+#    `agent.*` modules the plugin imports — the suite must run anywhere.
+try:
+    import agent  # noqa: F401 — real Hermes install present
+except ModuleNotFoundError:
+    import types as _types
+    _agent = _types.ModuleType("agent"); _agent.__path__ = []
+    _aux = _types.ModuleType("agent.auxiliary_client")
+    _aux.call_llm = lambda **kw: (_ for _ in ()).throw(RuntimeError("stubbed call_llm"))
+    _aux.aux_interrupt_protection = _noop_protect
+    _ce = _types.ModuleType("agent.context_engine")
+    class ContextEngine:  # minimal stand-in for the ABC
+        pass
+    _ce.ContextEngine = ContextEngine
+    _mm = _types.ModuleType("agent.model_metadata")
+    _mm.estimate_messages_tokens_rough = (
+        lambda messages: sum(len(str(m.get("content", ""))) for m in messages) // 4
+    )
+    _agent.auxiliary_client = _aux; _agent.context_engine = _ce; _agent.model_metadata = _mm
+    for _name, _mod in (("agent", _agent), ("agent.auxiliary_client", _aux),
+                        ("agent.context_engine", _ce), ("agent.model_metadata", _mm)):
+        sys.modules[_name] = _mod
+
+# 2) Deterministic config, applied AFTER the plugin load below: never read
+# the developer's real ~/.hermes/config.yaml (an ambient-config leak once
+# masked a threshold bug). With a real Hermes install we override only
+# load_config on the REAL module — agent.* imports other names from it
+# (load_env etc.), so a full fake module breaks those imports. Without a
+# Hermes install, install the fake module outright.
+FAKE_CONFIG = {"compact-context": {
+    "target_tokens": 7000, "preserve_first_n": 3, "preserve_last_n": 6,
+}}
+
 class FakeChoice:
     def __init__(self, content):
         self.message = type("M", (), {"content": content})()
@@ -34,6 +68,18 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 mod.call_llm = fake_call_llm
 mod.aux_interrupt_protection = _noop_protect
+
+try:
+    import hermes_cli.config as _hcc
+    _hcc.load_config = lambda: FAKE_CONFIG
+except ModuleNotFoundError:
+    import types as _t2
+    _hc = _t2.ModuleType("hermes_cli")
+    _hcc = _t2.ModuleType("hermes_cli.config")
+    _hcc.load_config = lambda: FAKE_CONFIG
+    _hc.config = _hcc
+    sys.modules["hermes_cli"] = _hc
+    sys.modules["hermes_cli.config"] = _hcc
 
 engine = mod.CompactEngine(context_length=1_000_000)
 engine.on_session_start("test-sess-abc")
@@ -210,5 +256,125 @@ e2.context_length = 1_000_000
 e2._recompute_threshold()
 assert e2.threshold_tokens == 200_000, "fixed-only must not be capped by a non-explicit percent"
 print("[12] both-set composes as min(); fixed-only semantics unchanged ✓")
+
+# 13. Config-load regression: an UNSET percent must not be "explicit" —
+# get()'s 0.20 default passes the range check and used to cap fixed-only
+# thresholds to min(fixed, 20% of window). Real _load_config path via fake config.
+_cc = FAKE_CONFIG["compact-context"]
+_cc["threshold_tokens"] = 300000
+e13 = mod.CompactEngine(context_length=1_000_000)
+assert e13._explicit_percent is False, "unset percent wrongly marked explicit"
+assert e13.threshold_tokens == 300000, f"fixed-only capped: {e13.threshold_tokens}"
+_cc["threshold_percent"] = 0.8
+e13b = mod.CompactEngine(context_length=1_000_000)
+assert e13b.threshold_tokens == 300000, "both-set: min(300K, 800K) should be 300K"
+_cc["threshold_percent"] = 0.1
+e13c = mod.CompactEngine(context_length=1_000_000)
+assert e13c.threshold_tokens == 100000, "both-set: min(300K, 100K) should be 100K"
+del _cc["threshold_tokens"], _cc["threshold_percent"]
+print("[13] config load: fixed-only uncapped; both-set composes as min() ✓")
+
+def _fresh_engine(**attrs):
+    e = mod.CompactEngine(context_length=1_000_000)
+    e.on_session_start("t-check")
+    e.transcript_enabled = False
+    for k, v in attrs.items():
+        setattr(e, k, v)
+    return e
+
+# 14. Orphaned-tool tail (claim 2): tools deleted before the marker decision
+# used to leave summary adjacent to a same-role message -> 400.
+msgs14 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"},
+    {"role": "assistant", "tool_calls": [{"id": "cx", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}]},
+] + [{"role": "tool", "tool_call_id": "cx", "content": "OUT"} for _ in range(7)]
+out14 = _fresh_engine(protect_first_n=2).compress(msgs14, current_tokens=250_000)
+for i in range(1, len(out14)):
+    assert out14[i]["role"] != out14[i-1]["role"], (
+        f"[14] alternation broken at {i}: {out14[i-1]['role']}->{out14[i]['role']}"
+    )
+assert not any(m.get("role") == "tool" for m in out14), "[14] orphaned tools must be gone"
+print(f"[14] orphaned-tool tail keeps strict alternation, roles={[m['role'] for m in out14]} ✓")
+
+# 15. Head cut between assistant(tool_calls) and its tool output (claim 3):
+# the unanswered call must be stripped, not shipped to the API.
+msgs15 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"},
+    {"role": "assistant", "tool_calls": [{"id": "ca", "type": "function",
+        "function": {"name": "edit_file", "arguments": '{"path":"x.py"}'}}]},
+    {"role": "tool", "tool_call_id": "ca", "content": "ok"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+]
+out15 = _fresh_engine(protect_first_n=2, preserve_last_n=2).compress(msgs15, current_tokens=250_000)
+answered = {m.get("tool_call_id") for m in out15 if m.get("role") == "tool"}
+for m in out15:
+    if m.get("tool_calls"):
+        assert set(tc.get("id") for tc in m["tool_calls"]) <= answered, (
+            f"[15] unanswered tool_calls survived: {[tc.get('id') for tc in m['tool_calls']]}"
+        )
+assert not out15[2].get("tool_calls"), "[15] head assistant must lose the unanswered call"
+print("[15] unanswered tool_calls stripped at the head boundary ✓")
+
+# 16. Secret scrub: whole private-key blocks (any type) redacted, truncated
+# blocks still lose the header.
+blob = ("pre -----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3NzaC1yc2EAAAAsecret1\n"
+        "-----END OPENSSH PRIVATE KEY----- mid -----BEGIN EC PRIVATE KEY-----\n"
+        "MHQCAQEsecret2\n-----END EC PRIVATE KEY----- post")
+scrubbed = mod._scrub_secrets(blob)
+assert "secret1" not in scrubbed and "secret2" not in scrubbed, "[16] key body leaked"
+assert "REDACTED" in scrubbed
+assert "BEGIN OPENSSH PRIVATE KEY" not in mod._scrub_secrets("x -----BEGIN OPENSSH PRIVATE KEY-----\nabc")
+print("[16] private-key blocks fully redacted (OPENSSH/EC + truncated) ✓")
+
+# 17. Backoff probes every 5th suppression instead of locking out forever,
+# and a model switch resets the failure state.
+e17 = _fresh_engine()
+e17._consecutive_failures = 3
+assert e17.should_compress(prompt_tokens=10**9) is False   # 3 % 5
+assert e17.should_compress(prompt_tokens=10**9) is False   # 4 % 5
+assert e17.should_compress(prompt_tokens=10**9) is True    # 5 % 5 -> probe
+e17._consecutive_failures = 7
+e17.update_model("new-model", context_length=1_000_000)
+assert e17._consecutive_failures == 0, "[17] update_model must reset backoff"
+print("[17] backoff probes every 5th turn; update_model resets ✓")
+
+# 18. Summarizer transcript includes tool-call arguments (file paths!).
+conv18 = mod._format_conversation_for_summary([
+    {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function",
+        "function": {"name": "edit_file", "arguments": '{"path": "src/app.py"}'}}], "content": ""},
+])
+assert "edit_file" in conv18 and "src/app.py" in conv18, "[18] args missing from formatter"
+print("[18] formatter includes tool-call arguments ✓")
+
+# 19. No stale re-ask after an answered tail: when the tail ends on the
+# assistant's answer, the old user message must NOT be re-appended after it.
+msgs19 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2-stale-question"},
+    {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}]},
+] + [{"role": "tool", "tool_call_id": "c2", "content": "OUT"} for _ in range(4)] + [
+    {"role": "assistant", "content": "a2-final-answer"},
+]
+out19 = _fresh_engine().compress(msgs19, current_tokens=250_000)
+assert out19[-1]["role"] == "assistant" and out19[-1]["content"] == "a2-final-answer", (
+    f"[19] stale re-ask: list ends on {out19[-1]}"
+)
+assert not any("u2-stale-question" in str(m.get("content", "")) for m in out19[3:]), (
+    "[19] stale question re-injected after the summary"
+)
+for i in range(1, len(out19)):
+    r_prev, r_i = out19[i-1]["role"], out19[i]["role"]
+    if r_prev == "tool" and r_i == "tool":
+        continue  # parallel tool results after one call are legal
+    assert r_i != r_prev, f"[19] alternation broken at {i}: {r_prev}->{r_i}"
+print(f"[19] answered tail: ends on the answer, no stale re-ask, roles={[m['role'] for m in out19]} ✓")
 
 print("\nALL CHECKS PASSED ✅")

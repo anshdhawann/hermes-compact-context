@@ -32,8 +32,9 @@ The host persists the compacted message list ONLY when `compression.in_place: tr
 2. **Transcript archive** — the FULL message list (head + body + tail, tool outputs included) is written as JSONL to `~/.hermes/sessions/<id>/compaction_transcript_<ts>.jsonl` (or `compact-context.transcript_dir` override). The path is injected into the summary message.
 3. **Summarization prompt** — body messages are formatted as a dense text transcript (tool outputs >4K chars truncated with a marker pointing at the on-disk transcript). The prompt requests an `<analysis>` + `<summary>` reply with 10 sections (ZCode's nine minus its Problem Solving/Pending Tasks, plus User Preferences, Security and Constraints, Key Decisions — and, since v2.2, ZCode's "All user messages" so the user's voice survives verbatim). `focus_topic` (from `/compress [topic]`) is forwarded and prioritized.
 4. **Summary call** — routed via `call_llm(task="compression")`; a dedicated summarizer model (config `compact-context.model`/`provider`) overrides the main runtime when set. `max_tokens = target_tokens × 1.5`. On any failure the engine returns messages unchanged (graceful degradation).
-5. **Assembly** — `[system+note] [head] [summary message] [tail] [last user message]`. The summary role is chosen to avoid consecutive same-role messages; if the message after the summary would repeat the summary's role, a synthetic boundary marker is inserted with the OPPOSITE role of the summary (not hardcoded — a hardcoded `user` marker produced three consecutive user messages whenever the summary itself was user-role). Orphaned `tool` messages (no active `tool_call_id`) are filtered.
-6. **Metadata** — the summary message is marked `_compressed_summary: true` (underscore keys are stripped by wire sanitizers before reaching the API).
+5. **Boundary repair (before assembly)** — head+tail run through the bidirectional tool-pair sanitizer FIRST: tools whose calling assistant was summarized into the body are dropped, and assistants whose tool results fell into the body lose those `tool_calls` (either shape is an instant 400). This happens before the marker decision so a deleted orphan can never invalidate it.
+6. **Assembly** — `[system+note] [head] [summary message] [tail] [last user message?]`. The summary role is chosen to avoid consecutive same-role messages; if the message after the summary would repeat the summary's role, a synthetic boundary marker is inserted with the OPPOSITE role of the summary (not hardcoded — a hardcoded `user` marker produced three consecutive user messages whenever the summary itself was user-role). The last user message is appended only when it repairs the list (dangling trailing tool / empty tail) or the session genuinely ends on it — after an assistant's answer it would read as a fresh re-ask of a completed task.
+7. **Metadata** — the summary message is marked `_compressed_summary: true` (underscore keys are stripped by wire sanitizers before reaching the API).
 
 ## Why role alternation matters
 
@@ -47,7 +48,7 @@ OpenAI-format backends reject adjacent messages with the same role. The summary 
 
 ## Testing
 
-`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 10-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`), and the fixed/percent threshold modes (fixed fires at exactly N; oversized or outgrown fixed values fall back to percent).
+`tests/test_compact_engine.py` runs without network (the summarizer LLM is stubbed) and without a Hermes install (`agent.*` stubs installed when absent; `hermes_cli.load_config` overridden with a fake so tests never read the developer's real config — an ambient-config leak once masked a threshold bug). It verifies: transcript written with all messages, pointer injected, tail preserved, head preserved with no body leak, final user message present, 10-section prompt + focus topic + truncation marker, summarizer call config, strict role alternation, a regression case for the boundary marker (tool-ended head → user-role summary + user-started tail → marker must flip to `assistant`), the fixed/percent/min() threshold modes through the real config-load path, orphaned-tool tails, unanswered tool_calls at the head boundary, private-key block scrubbing, backoff probing, tool-argument formatting, and the no-stale-re-ask rule after an answered tail.
 
 ```bash
 python3 tests/test_compact_engine.py
@@ -57,8 +58,16 @@ python3 tests/test_compact_engine.py
 ## Hardening (v2.1)
 - `threshold_percent` is config-driven (was class-attr only).
 - `transcript_retain` keeps the N most recent transcript files (default 2) to bound disk usage.
-- Post-summary secret scrub is code-enforced (sk-*, sbp_*, gho_*, Bearer, private keys, key=value) — not just a prompt instruction.
+- Post-summary secret scrub is code-enforced (sk-*, sbp_*, gho_, Bearer, private keys, key=value) — not just a prompt instruction.
 - Body-too-large guard (80% of context_length) skips a turn when the body itself would overflow the summarizer.
+
+## Hardening (v2.4.1 — external review)
+- "Explicit" threshold percent now requires the config key to be PRESENT (a valid-range default used to mark it explicit and silently cap fixed-only thresholds).
+- Tool-pair repair is bidirectional and runs on head+tail BEFORE the marker decision: orphaned tools can no longer be deleted after influencing it (left user,user adjacency), and head assistants lose calls whose results were summarized away.
+- Last-user-message append is conditional: repairs dangling-tool endings and normal user endings; skipped after an assistant answer (was a stale re-ask of a finished task).
+- Private-key scrub replaces whole blocks (header through footer, any key type; truncated blocks still lose the header).
+- Backoff after summarizer failures probes every 5th turn instead of locking compaction off for the session; `update_model()` resets the failure count.
+- Summarizer transcript includes tool-call argument previews (file paths/commands), not just tool names.
 - `should_compress` falls back to `estimate_messages_tokens_rough` when the provider omits `prompt_tokens`; backoff after 3 consecutive failures.
 - Prompt delimiters are escaped in message content so `---END---` cannot break the prompt structure.
 
