@@ -332,12 +332,13 @@ assert "BEGIN OPENSSH PRIVATE KEY" not in mod._scrub_secrets("x -----BEGIN OPENS
 print("[16] private-key blocks fully redacted (OPENSSH/EC + truncated) ✓")
 
 # 17. Backoff probes every 5th suppression instead of locking out forever,
-# and a model switch resets the failure state.
+# and a model switch resets the failure state. Mid-window tokens (v2.5.0:
+# 10**9 would now PUNCH THROUGH as urgent >=95% of the window).
 e17 = _fresh_engine()
 e17._consecutive_failures = 3
-assert e17.should_compress(prompt_tokens=10**9) is False   # 3 % 5
-assert e17.should_compress(prompt_tokens=10**9) is False   # 4 % 5
-assert e17.should_compress(prompt_tokens=10**9) is True    # 5 % 5 -> probe
+assert e17.should_compress(prompt_tokens=500_000) is False   # 3 % 5
+assert e17.should_compress(prompt_tokens=500_000) is False   # 4 % 5
+assert e17.should_compress(prompt_tokens=500_000) is True    # 5 % 5 -> probe
 e17._consecutive_failures = 7
 e17.update_model("new-model", context_length=1_000_000)
 assert e17._consecutive_failures == 0, "[17] update_model must reset backoff"
@@ -377,4 +378,161 @@ for i in range(1, len(out19)):
     assert r_i != r_prev, f"[19] alternation broken at {i}: {r_prev}->{r_i}"
 print(f"[19] answered tail: ends on the answer, no stale re-ask, roles={[m['role'] for m in out19]} ✓")
 
-print("\nALL CHECKS PASSED ✅")
+# -- v2.5.0: failure ladder (fallback -> rescue -> fail-open) ---------------
+
+_cc = FAKE_CONFIG["compact-context"]
+# Shared alternating conversation: head=[S,u0,a0,u1], body=[a1,u2],
+# tail=[a2,u3,a3,u4,a4,u5] (n=12 > head+2).
+msgs_chain = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+    {"role": "user", "content": "u5"},
+]
+
+# 20. Aux->main fallback: dedicated summarizer raises, the MAIN model
+# rescues the SAME compaction instead of failing open.
+_calls20 = []
+def _flaky_llm20(**kwargs):
+    _calls20.append(kwargs)
+    if kwargs.get("model") == "stub/sum-model":
+        raise RuntimeError("summarizer down")
+    return FakeResponse("## Goal\nFallback summary OK")
+_cc["model"] = "stub/sum-model"
+_cc["provider"] = "stub-prov"
+e20 = mod.CompactEngine(context_length=1_000_000)
+e20.transcript_enabled = False  # keep test writes out of ~/.hermes
+assert e20._summary_model == "stub/sum-model", "[20] summary model not loaded from config"
+mod.call_llm = _flaky_llm20
+out20 = e20.compress(msgs_chain, current_tokens=250_000)
+assert len(_calls20) == 2, f"[20] expected summarizer+main attempts, got {len(_calls20)}"
+assert _calls20[0].get("model") == "stub/sum-model" and "model" not in _calls20[1], (
+    f"[20] chain order wrong: {[c.get('model') for c in _calls20]}"
+)
+assert any("Fallback summary OK" in str(m.get("content", "")) for m in out20), (
+    "[20] main-fallback summary missing from output"
+)
+assert e20._consecutive_failures == 0, "[20] chain success must reset backoff"
+del _cc["model"], _cc["provider"]
+mod.call_llm = fake_call_llm
+print("[20] summarizer failure falls back to main model in the same compaction ✓")
+
+# 21. Mechanical rescue: the whole chain is down AND the session sits at
+# >=95% of the window — compact anyway with a stub pointing at the
+# already-archived transcript instead of letting the next main call 400.
+def _dead_llm(**kwargs):
+    raise RuntimeError("everything down")
+_cc["model"] = "stub/sum-model"
+e21 = mod.CompactEngine(context_length=1_000_000)
+e21.on_session_start("t-rescue")
+e21.transcript_enabled = True
+e21.transcript_dir = tempfile.mkdtemp(prefix="compact-rescue-")
+mod.call_llm = _dead_llm
+out21 = e21.compress(msgs_chain, current_tokens=int(1_000_000 * 0.96))
+# NOTE: output count can equal input count (head 4 + stub + marker + tail 6);
+# the win is the ~960K-token body collapsing into the stub, not msg count.
+assert out21 is not msgs_chain, "[21] rescue must still compact"
+stub21 = [m for m in out21 if "Compaction fallback notice" in str(m.get("content", ""))]
+assert stub21, "[21] rescue stub summary missing"
+assert "compaction_transcript" in stub21[0]["content"], "[21] stub must point at the transcript"
+assert not any("## Goal" in str(m.get("content", "")) for m in out21), "[21] no LLM summary expected"
+assert e21._consecutive_failures == 1, "[21] rescue must still count the LLM failure"
+assert e21.compression_count == 1
+for i in range(1, len(out21)):
+    assert out21[i]["role"] != out21[i-1]["role"], (
+        f"[21] alternation broken at {i}: {out21[i-1]['role']}->{out21[i]['role']}"
+    )
+print(f"[21] mechanical rescue near overflow, roles={[m['role'] for m in out21]} ✓")
+
+# 22. Fail-open preserved BELOW the urgency line: chain down at mid tokens
+# returns messages unchanged (rescue is a last resort, not the default).
+e22 = mod.CompactEngine(context_length=1_000_000)
+e22.transcript_enabled = False
+e22.on_session_start("t-failopen")
+out22 = e22.compress(msgs_chain, current_tokens=250_000)
+assert out22 is msgs_chain, "[22] non-urgent failure must return messages unchanged"
+assert e22._consecutive_failures == 1
+del _cc["model"]
+mod.call_llm = fake_call_llm
+print("[22] non-urgent summarizer failure still fails open (unchanged messages) ✓")
+
+# 23. Urgency punch-through: backoff must never suppress a turn at >=95% of
+# the window — compress() owns the main-model fallback and the rescue.
+e23 = mod.CompactEngine(context_length=1_000_000)
+e23._consecutive_failures = 4
+assert e23.should_compress(prompt_tokens=500_000) is False, "[23] mid tokens must stay suppressed"
+assert e23.should_compress(prompt_tokens=int(1_000_000 * 0.96)) is True, (
+    "[23] urgent turn must punch through backoff"
+)
+print("[23] >=95%-of-window turns punch through backoff suppression ✓")
+
+# 24. Chain-aware guard: a KNOWN bigger summarizer window relaxes the body
+# guard (v2.4.1 would skip); a KNOWN smaller one routes straight to main.
+_calls24 = []
+def _tap_llm24(**kwargs):
+    _calls24.append(kwargs)
+    return FakeResponse("## Goal\nTap summary")
+mod.call_llm = _tap_llm24
+msgs24 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "big " + "X" * (260_000 * 4)},  # ~260K-token body message
+    {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+]
+_cc["model"] = "stub/sum-model"
+_cc["summary_context_length"] = 1_000_000
+_cc["preserve_last_n"] = 2  # keep the big message in the BODY, not the tail
+e24a = mod.CompactEngine(context_length=200_000)  # main guard alone = 160K < body
+e24a.transcript_enabled = False
+out24a = e24a.compress(msgs24, current_tokens=250_000)
+assert any("Tap summary" in str(m.get("content", "")) for m in out24a), (
+    "[24a] big-window summarizer must NOT be blocked by the main-window guard"
+)
+assert _calls24[0].get("model") == "stub/sum-model", "[24a] summarizer attempt expected"
+del _cc["summary_context_length"]
+_cc["summary_context_length"] = 100_000          # 80K one-pass cap < 260K body
+e24b = mod.CompactEngine(context_length=1_000_000)
+e24b.transcript_enabled = False
+out24b = e24b.compress(msgs24, current_tokens=250_000)
+assert any("Tap summary" in str(m.get("content", "")) for m in out24b), "[24b] compaction must still happen"
+assert len(_calls24) == 2 and "model" not in _calls24[1], (
+    f"[24b] small-window summarizer must be skipped, went straight to main: {_calls24[1].get('model')}"
+)
+e24c = mod.CompactEngine(context_length=200_000)  # body exceeds BOTH windows
+e24c.transcript_enabled = False
+out24c = e24c.compress(msgs24, current_tokens=250_000)
+assert out24c is msgs24 and len(_calls24) == 2, "[24c] body exceeding both windows must be skipped, no calls"
+del _cc["model"], _cc["summary_context_length"]
+_cc["preserve_last_n"] = 6
+mod.call_llm = fake_call_llm
+print("[24] guard relaxes for a bigger summarizer window; routes around a smaller one ✓")
+
+# 25. Post-compact floor warning: a threshold below the un-trimmable floor
+# (system prompt + preserved head/tail + summary) re-triggers compaction
+# every turn — must warn on the FIRST compaction (the 2026-09-01 mess).
+import logging as _logging
+_records25 = []
+class _ListHandler(_logging.Handler):
+    def emit(self, record):
+        _records25.append(record.getMessage())
+_h25 = _ListHandler()
+mod.logger.addHandler(_h25)
+try:
+    _cc["threshold_tokens"] = 50  # absurdly low: any compacted output exceeds it
+    e25 = mod.CompactEngine(context_length=1_000_000)
+    e25.transcript_enabled = False
+    assert e25.threshold_tokens == 50
+    e25.compress(msgs_chain, current_tokens=250_000)
+    assert any("still >= threshold" in r for r in _records25), "[25] floor warning not emitted"
+finally:
+    mod.logger.removeHandler(_h25)
+    del _cc["threshold_tokens"]
+print("[25] post-compact floor warning fires when output >= threshold ✓")
+
+print("\nALL 25 CHECKS PASSED ✅")

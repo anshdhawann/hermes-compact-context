@@ -47,11 +47,14 @@ compact-context:
   transcript_retain: 2      # keep N most recent transcript files (0 = keep all)
   model: zai/GLM-5.2        # dedicated summarizer — MUST fit the full conversation (1M window recommended)
   provider: opencode-go
+  summary_context_length: 0 # summarizer's window in tokens (0 = auto: Hermes' discovered-length cache)
 compression:
   in_place: true            # REQUIRED — see Install
 ```
 
-**Important:** the summarizer reads the entire conversation in one pass, so its context window must be at least as large as your session. A 1M-context model (e.g. GLM-5.2) is recommended; if the summary call fails, the engine keeps messages unchanged and logs a warning.
+**Important:** the summarizer reads the entire conversation in one pass, so its context window must be at least as large as your session. A 1M-context model (e.g. GLM-5.2) is recommended.
+
+**Failure ladder** (v2.5.0) — if the summarizer fails, the engine degrades in stages instead of losing the session: (1) retry once with the **main model** (the summarizer call always carries the main runtime as fallback); (2) if the whole chain is down **and** the session sits at ≥95% of the window, **mechanically rescue** — compact anyway with a stub summary pointing at the already-archived transcript (nothing is summarized, nothing is lost, the next main call doesn't 400); (3) otherwise fail open: messages unchanged, warning logged, backoff with every-5th-turn probes. A body too large for every window in the chain is skipped up front (the guard uses the best known window — set `summary_context_length` if the summarizer's window differs from the main model's). And if the compacted output still sits above your threshold, a post-compact floor warning tells you the un-trimmable floor (system prompt + preserved head/tail) is too big for the configured trigger.
 
 Trigger tuning: `threshold_tokens` alone = fixed mode (fires at exactly N tokens); `threshold_percent` alone = relative (default 0.20). Set **both** and they compose as **min()** — e.g. `threshold_percent: 0.8` + `threshold_tokens: 200000` fires at min(80% of window, 200K): ride the window on small models, but never past 200K on big ones. min() is always safely below the window (the percent is validated to 0.05–0.95), so it can never trip the overflow guard. A fixed-only value ≥ 95% of the context window can never fire in time, so it's ignored with a warning and the percent rule is used instead — re-checked on every model switch, since the window can change. The built-in `compression.threshold` config does NOT govern plugin engines.
 

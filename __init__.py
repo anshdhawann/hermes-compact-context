@@ -93,6 +93,20 @@ RESUME_NOTE = (
     "never happened."
 )
 
+# Mechanical rescue stub: used ONLY when the summarizer chain failed while
+# the session sat at >=95% of the window, where failing open means the next
+# main call dies of overflow. The transcript is already on disk at this
+# point, so the stub points the model at it instead of a written summary.
+MECHANICAL_RESCUE_SUMMARY = (
+    "## Compaction fallback notice\n"
+    "The summarizer model failed while this session was near its context "
+    "limit, so the older conversation was archived WITHOUT a written "
+    "summary.\n\nFull pre-compaction transcript: {path}\n\n"
+    "Re-read that transcript file to recover exact details (requests, file "
+    "paths, code, decisions) before continuing. The recent history below "
+    "is preserved verbatim."
+)
+
 SUMMARY_END_MARKER = "[END OF FULL COMPACTION SUMMARY]"
 
 # Delimiter used to wrap conversation in prompt - sanitized in formatter so
@@ -286,6 +300,9 @@ class CompactEngine(ContextEngine):
         # Dedicated summarizer model/provider (read from config, may be None).
         self._summary_model: Optional[str] = None
         self._summary_provider: Optional[str] = None
+        # Explicit summarizer context window from config (0 = unknown; then
+        # Hermes' discovered-length cache is consulted — see _summary_window).
+        self._summary_context_length: int = 0
 
         # Transcript archive (ZCode replica)
         self._session_id: Optional[str] = None
@@ -383,21 +400,47 @@ class CompactEngine(ContextEngine):
                     self._summary_model = cfg_model
                 if cfg_provider:
                     self._summary_provider = cfg_provider
+                try:
+                    self._summary_context_length = int(compact_cfg.get("summary_context_length", 0) or 0)
+                except (TypeError, ValueError):
+                    self._summary_context_length = 0
                 logger.info(
                     "Compact engine config: target_tokens=%d, preserve_first_n=%d, "
                     "preserve_last_n=%d, threshold_percent=%.2f, threshold_tokens_cfg=%d "
                     "(fires at %d tokens), "
                     "transcript_enabled=%s, "
-                    "summary_model=%s, summary_provider=%s",
+                    "summary_model=%s, summary_provider=%s, summary_window=%d",
                     self.target_tokens, self.protect_first_n,
                     self.preserve_last_n, self.threshold_percent,
                     self.threshold_tokens_cfg,
                     self.threshold_tokens,
                     self.transcript_enabled,
                     self._summary_model, self._summary_provider,
+                    self._summary_context_length,
                 )
         except Exception:
             logger.debug("Could not read compact-context config, using defaults")
+
+    def _summary_window(self) -> int:
+        """Known context window of the dedicated summarizer (0 = unknown).
+
+        Explicit ``summary_context_length`` config wins; else Hermes'
+        discovered-length cache (a pure disk read — the compaction hot path
+        must never probe the network). Used by the body guard and per-attempt
+        routing: a summarizer with a BIGGER window than main relaxes the
+        guard; a smaller one is skipped outright for bodies it cannot read.
+        """
+        if self._summary_context_length > 0:
+            return self._summary_context_length
+        if self._summary_model:
+            try:
+                from agent.model_metadata import get_cached_context_length
+                hit = get_cached_context_length(self._summary_model, "")
+                if hit and int(hit) > 0:
+                    return int(hit)
+            except Exception:
+                pass
+        return 0
 
     @property
     def name(self) -> str:
@@ -411,14 +454,6 @@ class CompactEngine(ContextEngine):
         )
 
     def should_compress(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> bool:
-        # Backoff after repeated summarizer failures to avoid spam — but
-        # probe every 5th turn instead of dying for the rest of the session:
-        # while suppressed, compress() never runs, so nothing but a probe
-        # can ever reset the counter.
-        if self._consecutive_failures >= 3 and self._consecutive_failures % 5 != 0:
-            self._consecutive_failures += 1
-            logger.info("Compact: suppressed by backoff (%d consecutive failures)", self._consecutive_failures)
-            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens <= 0 and messages is not None:
             try:
@@ -426,6 +461,20 @@ class CompactEngine(ContextEngine):
             except Exception:
                 tokens = 0
         if tokens <= 0:
+            return False
+        # Urgency punch-through: at >=95% of the window the next main call can
+        # 400 on overflow, so compress() MUST run — its failure path is the
+        # only place the main-model fallback and the mechanical rescue live.
+        # Backoff never suppresses this (the rescue needs no LLM at all).
+        if self.context_length > 0 and tokens >= self.context_length * 0.95:
+            return True
+        # Backoff after repeated summarizer failures to avoid spam — but
+        # probe every 5th turn instead of dying for the rest of the session:
+        # while suppressed, compress() never runs, so nothing but a probe
+        # can ever reset the counter.
+        if self._consecutive_failures >= 3 and self._consecutive_failures % 5 != 0:
+            self._consecutive_failures += 1
+            logger.info("Compact: suppressed by backoff (%d consecutive failures)", self._consecutive_failures)
             return False
         return tokens >= self.threshold_tokens
 
@@ -555,17 +604,19 @@ class CompactEngine(ContextEngine):
         if transcript_path:
             self._prune_old_transcripts(transcript_path)
 
-        # Guard: if body itself exceeds ~80% of context window, summarizing will
-        # fail (summarizer must read full body in one pass). Skip and back off.
+        # Guard: the summarizer must read the whole body in ONE pass. Skip
+        # when the body exceeds ~80% of the best window in the candidate
+        # chain — a dedicated summarizer with a KNOWN bigger window relaxes
+        # this guard; a known smaller one is routed around per-attempt below.
+        body_tokens_est = 0
         try:
             body_tokens_est = estimate_messages_tokens_rough(body)
-            # Use summarizer window if known, else main context_length as proxy
-            # 1M is the advertised summarizer window; cap guard at 800k.
-            guard_limit = int(self.context_length * 0.80)
+            guard_window = max(self.context_length, self._summary_window())
+            guard_limit = int(guard_window * 0.80)
             if body_tokens_est > guard_limit:
                 logger.warning(
                     "Compact: body ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
-                    body_tokens_est, guard_limit, self.context_length,
+                    body_tokens_est, guard_limit, guard_window,
                 )
                 return messages
         except Exception:
@@ -597,42 +648,78 @@ class CompactEngine(ContextEngine):
             conversation_text=conversation_text,
         )
 
-        # Call the LLM for summarization
-        try:
-            call_kwargs = {
-                "task": "compression",
-                "main_runtime": {
-                    "model": self._model,
-                    "provider": self._provider,
-                    "base_url": self._base_url,
-                    "api_key": self._api_key,
-                    "api_mode": self._api_mode,
-                },
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(self.target_tokens * 1.5),
-            }
-            # Prefer the dedicated summarizer model if configured. The
-            # summarizer must read the full conversation in one pass, so it
-            # needs a window large enough (e.g. GLM-5.2 @ 1M). When set,
-            # explicit args override main_runtime in call_llm.
-            if self._summary_model:
-                call_kwargs["model"] = self._summary_model
+        # Candidate chain: dedicated summarizer first (when configured AND its
+        # known window can hold the body in one pass), then the MAIN model as
+        # fallback — a summarizer too small for the body is skipped outright,
+        # and a summarizer failure falls back to main instead of failing open.
+        call_kwargs = {
+            "task": "compression",
+            "main_runtime": {
+                "model": self._model,
+                "provider": self._provider,
+                "base_url": self._base_url,
+                "api_key": self._api_key,
+                "api_mode": self._api_mode,
+            },
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": int(self.target_tokens * 1.5),
+        }
+        summary_window = self._summary_window()
+        attempts = []
+        if self._summary_model and (summary_window <= 0 or body_tokens_est <= summary_window * 0.80):
+            attempts.append(dict(call_kwargs, model=self._summary_model))
             if self._summary_provider:
-                call_kwargs["provider"] = self._summary_provider
-            with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                attempts[-1]["provider"] = self._summary_provider
+        elif self._summary_model:
+            logger.info(
+                "Compact: body ~%d exceeds summarizer window %d — going straight to the main model",
+                body_tokens_est, summary_window,
+            )
+        if body_tokens_est <= self.context_length * 0.80:
+            attempts.append(dict(call_kwargs))  # main model via main_runtime
 
-            summary = response.choices[0].message.content
-            if not summary or not summary.strip():
-                logger.warning("Compact: LLM returned empty summary, keeping messages unchanged")
-                self._consecutive_failures += 1
-                return messages
+        summary = None
+        last_err = "no attempt made"
+        for i, attempt_kwargs in enumerate(attempts):
+            label = f"attempt {i + 1}/{len(attempts)}"
+            try:
+                with aux_interrupt_protection():
+                    response = call_llm(**attempt_kwargs)
+                candidate = response.choices[0].message.content
+                if candidate and candidate.strip():
+                    summary = candidate
+                    if i > 0:
+                        logger.info(
+                            "Compact: main-model fallback succeeded after %s failed",
+                            attempts[0].get("model", "main"),
+                        )
+                    break
+                last_err = f"{label}: empty summary"
+            except Exception as e:
+                last_err = f"{label}: {e}"
+            logger.info("Compact: summarizer %s failed (%s)", label, last_err)
+
+        if summary is not None:
             # Code-enforced redaction (prompt says REDACT, but we enforce it)
             summary = _scrub_secrets(summary)
             self._consecutive_failures = 0
-
-        except Exception as e:
-            logger.warning("Compact: LLM summary failed: %s — keeping messages unchanged", e)
+        elif display_tokens >= self.context_length * 0.95:
+            # Mechanical rescue at the edge of overflow: the LLM chain is
+            # down but the transcript is ALREADY on disk — compact anyway
+            # with a stub pointing at it. Failing open here means the next
+            # main call 400s and the session dies.
+            self._consecutive_failures += 1
+            logger.warning(
+                "Compact: summarizer chain failed near the context limit (%s) — "
+                "mechanical rescue, full transcript at %s",
+                last_err, transcript_path or "(archive unavailable)",
+            )
+            summary = MECHANICAL_RESCUE_SUMMARY.format(
+                path=transcript_path or
+                "(transcript unavailable — older turns could not be archived)",
+            )
+        else:
+            logger.warning("Compact: LLM summary failed: %s — keeping messages unchanged", last_err)
             self._consecutive_failures += 1
             return messages
 
@@ -726,6 +813,26 @@ class CompactEngine(ContextEngine):
             n_messages, len(compressed),
             (1 - len(compressed) / max(n_messages, 1)) * 100,
         )
+
+        # Floor warning: if even the compacted list sits at/above the fire
+        # threshold, the un-trimmable floor (system prompt + preserved head
+        # and tail + summary) is too big for the configured threshold and
+        # compaction will re-trigger EVERY turn. Better caught here, on the
+        # first compaction, than rediscovered from a log full of
+        # "summarizing 1 turns" lines.
+        try:
+            out_tokens = estimate_messages_tokens_rough(compressed)
+            if self.threshold_tokens > 0 and out_tokens >= self.threshold_tokens:
+                logger.warning(
+                    "Compact: post-compaction size ~%d tokens still >= threshold %d — "
+                    "un-trimmable floor too large (system prompt + preserve_first_n=%d "
+                    "+ preserve_last_n=%d + summary); raise the threshold or lower "
+                    "preserve_* or compaction will re-trigger every turn",
+                    out_tokens, self.threshold_tokens,
+                    self.protect_first_n, self.preserve_last_n,
+                )
+        except Exception:
+            pass
         return compressed
 
     # -- Helpers -------------------------------------------------------------

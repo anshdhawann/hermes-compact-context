@@ -28,5 +28,9 @@ is the design, not an accident — preserve it.
    assistant/assistant are not.
 6. Behavior change → bump `version:` in `plugin.yaml` in the same commit.
 7. **Never simplify away:** graceful degradation (LLM failure → messages
-   unchanged), the secret scrub, strict role alternation. These exist because
-   each one was a live incident.
+   unchanged), the secret scrub, strict role alternation, and the failure
+   ladder (main-model fallback → mechanical rescue at ≥95% of the window →
+   fail open with backoff). These exist because each one was a live incident
+   or a reviewed near-miss; the rescue especially must survive refactors —
+   it is the only path that prevents a dead summarizer from killing the
+   session to context overflow.

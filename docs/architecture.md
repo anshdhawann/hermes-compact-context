@@ -71,6 +71,18 @@ python3 tests/test_compact_engine.py
 - `should_compress` falls back to `estimate_messages_tokens_rough` when the provider omits `prompt_tokens`; backoff after 3 consecutive failures.
 - Prompt delimiters are escaped in message content so `---END---` cannot break the prompt structure.
 
+## Failure ladder (v2.5.0 — Codex-inspired, cross-reviewed)
+The summarizer call is now a candidate CHAIN, and the failure mode degrades in stages instead of losing the session:
+
+1. **Attempt order:** dedicated summarizer (when configured and its known window can hold the body in one pass), then the MAIN model via `main_runtime`. A summarizer whose known window is too small is skipped outright (logged); an unknown window (0) is always attempted.
+2. **Body guard is chain-aware:** skip only when the body exceeds 80% of the BEST window in the chain — a 1M summarizer on a small-window main relaxes the guard that previously (and wrongly) used the main window alone; a small summarizer no longer receives doomed one-pass bodies. Window resolution: explicit `summary_context_length` config → Hermes' discovered-length cache (`get_cached_context_length`, a pure disk read — never a network probe in the hot path) → unknown.
+3. **Mechanical rescue:** if the whole chain fails while the session sits at ≥95% of the window, compact ANYWAY — head + stub summary pointing at the already-archived transcript + tail. Failing open at that point means the next main call 400s and the session dies; the transcript is written before the summarizer is ever called, so the rescue always has material. The rescue still counts as an LLM failure for backoff.
+4. **Urgency punch-through:** `should_compress` never lets backoff suppress a ≥95%-of-window turn — that turn's `compress()` is the only place the fallback and rescue exist.
+5. **Fail open (unchanged):** below the urgency line, a failed chain returns messages unchanged, increments backoff, probes every 5th turn.
+6. **Post-compact floor warning:** if the assembled output still sits at/above the fire threshold, warn immediately — the un-trimmable floor (system prompt + preserved head/tail + summary) exceeds the trigger and compaction would re-fire every turn. This is the 2026-09-01 production incident (threshold 49,152 below a ~92K system-prompt floor) made self-announcing: it now surfaces on the first compaction instead of from log forensics.
+
+Design cross-check: the rescue shape (shrink-and-retry near overflow instead of fail-open) and the aux→main fallback are patterned on Codex's overflow handling; Codex's `BodyAfterPrefix` trigger scoping and recompact-on-model-change were evaluated and rejected (our threshold recomputes on `update_model()` already, and the floor problem is guarded by the warning above).
+
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).
