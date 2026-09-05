@@ -644,4 +644,97 @@ assert os.path.exists(p1) and os.path.exists(p2), "[30] one archive was overwrit
 assert os.path.basename(p1).startswith("compaction_transcript_"), "[30] glob/prune pattern broken"
 print("[30] same-second transcript writes are unique and both survive ✓")
 
-print("\nALL 30 CHECKS PASSED ✅")
+# -- v2.5.2: Astra round 2 — straddling transactions, pinned fallback,
+#    rescue output must fit ---------------------------------------------------
+
+# 31. A tool transaction straddling the head|tail seam must not survive as
+# two halves with the summary between pending calls and their results
+# (joint sanitization kept the pair; assembly split it -> protocol 400).
+msgs31 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"},
+    {"role": "assistant", "tool_calls": [
+        {"id": "tc1", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+        {"id": "tc2", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+    ], "content": ""},
+    {"role": "tool", "tool_call_id": "tc1", "content": "R1"},   # head ends here
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "tool", "tool_call_id": "tc2", "content": "R2-LATE"},  # tail straddler
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+]
+out31 = _fresh_engine().compress(msgs31, current_tokens=250_000)
+flat31 = str(out31)
+assert "tc2" not in flat31, "[31] straddling call/result must be dropped from BOTH sides"
+answered31 = {m.get("tool_call_id") for m in out31 if m.get("role") == "tool"}
+for m in out31:
+    if m.get("tool_calls"):
+        assert set(tc.get("id") for tc in m["tool_calls"]) <= answered31, (
+            f"[31] pending calls left open: {[tc.get('id') for tc in m['tool_calls']]}"
+        )
+for i in range(1, len(out31)):
+    r_prev, r_i = out31[i-1]["role"], out31[i]["role"]
+    if r_prev == "tool" and r_i == "tool":
+        continue  # parallel tool results after one call are legal
+    assert r_i != r_prev, f"[31] alternation broken at {i}: {r_prev}->{r_i}"
+print(f"[31] straddling transaction dropped from both sides, roles={[m['role'] for m in out31]} ✓")
+
+# 32. The main-model fallback is PINNED: without explicit model args,
+# call_llm resolves task='compression' from auxiliary.compression config
+# BEFORE the main runtime — the "fallback" could retry the same summarizer.
+_calls32 = []
+def _pin_llm32(**kwargs):
+    _calls32.append(kwargs)
+    if kwargs.get("model") == "stub/sum-model":
+        raise RuntimeError("summarizer down")
+    return FakeResponse("## Goal\nPinned fallback OK")
+_cc["model"] = "stub/sum-model"
+e32 = mod.CompactEngine(context_length=1_000_000)
+e32.update_model(model="real-main-model", provider="main-prov", context_length=1_000_000)
+mod.call_llm = _pin_llm32
+out32 = e32.compress(msgs_chain, current_tokens=250_000)
+assert len(_calls32) == 2, f"[32] expected 2 attempts, got {len(_calls32)}"
+assert _calls32[1].get("model") == "real-main-model", (
+    f"[32] fallback not pinned to main model: {_calls32[1].get('model')}"
+)
+assert _calls32[1].get("provider") == "main-prov", "[32] fallback provider not pinned"
+assert any("Pinned fallback OK" in str(m.get("content", "")) for m in out32)
+del _cc["model"]
+mod.call_llm = fake_call_llm
+print("[32] main-model fallback passes the main route explicitly ✓")
+
+# 33. The rescue output MUST fit: a huge preserved tail tool result gets
+# trimmed (whole transactions) until head + stub + tail fits the window.
+def _dead_llm33(**kwargs):
+    raise RuntimeError("down")
+e33 = mod.CompactEngine(context_length=10_000)
+e33.on_session_start("t-trim")
+e33.transcript_enabled = True
+e33.transcript_dir = tempfile.mkdtemp(prefix="compact-trim-")
+mod.call_llm = _dead_llm33
+msgs33 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"},
+    {"role": "assistant", "tool_calls": [{"id": "big", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}], "content": ""},
+    {"role": "tool", "tool_call_id": "big", "content": "T" * 200_000},  # ~50K tokens, in tail
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+]
+out33 = e33.compress(msgs33, current_tokens=9_800)  # 98% of the 10K window -> rescue
+est33 = mod.estimate_messages_tokens_rough(out33)
+assert est33 <= 9_500, f"[33] rescue output does not fit: ~{est33} tokens > 9500"
+assert not any("TTTT" in str(m.get("content", "")) for m in out33), "[33] oversized tail content must be trimmed"
+assert any("Compaction fallback notice" in str(m.get("content", "")) for m in out33), "[33] rescue stub missing"
+assert not any(m.get("tool_calls") or m.get("role") == "tool" for m in out33), "[33] trimmed transaction left debris"
+for i in range(1, len(out33)):
+    assert out33[i]["role"] != out33[i-1]["role"], (
+        f"[33] alternation broken at {i}: {out33[i-1]['role']}->{out33[i]['role']}"
+    )
+mod.call_llm = fake_call_llm
+print(f"[33] rescue trims the tail until output fits (~{est33} tokens), roles={[m['role'] for m in out33]} ✓")
+
+print("\nALL 33 CHECKS PASSED ✅")

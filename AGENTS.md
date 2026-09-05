@@ -34,6 +34,14 @@ is the design, not an accident — preserve it.
    bypassed the rescue precisely when it was needed. Rescue tests must make
    the BODY itself trigger the condition (oversized/unreadable), not just
    pin a huge `current_tokens` on a tiny conversation.
+5d. Tool transactions are atomic across the compaction seam: head and tail
+   are sanitized INDEPENDENTLY, and a pair straddling them is dropped from
+   both sides — the summary message must never sit between pending
+   tool_calls and their results (v2.5.2). The rescue's contract is that the
+   OUTPUT FITS: emergency mode trims the tail until head + stub + tail is
+   inside the window, and any auxiliary-LLM call meant to hit a DIFFERENT
+   model than the aux-config default must pin its route explicitly
+   (`call_llm` resolves `auxiliary.{task}.*` before the main runtime).
 6. Behavior change → bump `version:` in `plugin.yaml` in the same commit.
 7. **Never simplify away:** graceful degradation (LLM failure → messages
    unchanged), the secret scrub, strict role alternation, and the failure

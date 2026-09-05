@@ -91,6 +91,12 @@ Five verified findings, each with a regression check ([26]–[30]):
 4. **PKCS#8 keys survived redaction.** The regex required a type word (`RSA`/`EC`/...) before `PRIVATE KEY`, so plain `-----BEGIN PRIVATE KEY-----` passed intact, and truncated typed blocks kept their base64 body after the header was removed. The pattern now makes the type optional in BEGIN and END, and an unterminated block redacts through to the next `-----BEGIN` line or end of input (over-redaction is safe; leakage is not).
 5. **Transcript filenames could collide.** One-second timestamps opened in `w` mode: two writes within a second (or concurrent sessions sharing the fallback dir) silently overwrote an archive. Writes now use `tempfile.mkstemp` (timestamp prefix + unique suffix, exclusive create).
 
+## Fixes (v2.5.2 — Astra round 2)
+Three more verified findings, checks [31]–[33]:
+1. **Transactions straddling the head|tail seam survived as split halves.** Joint sanitization kept a pair whose assistant sat in the head and whose (parallel) result sat in the tail — then assembly inserted the summary BETWEEN pending tool_calls and their remaining results (400). Head and tail are now sanitized INDEPENDENTLY: a transaction is preserved only when it lives entirely inside one side; a straddling pair is dropped from both (the transcript keeps the content).
+2. **The "main-model fallback" could retry the same summarizer.** Without explicit route args, `call_llm` resolves `task="compression"` from the `auxiliary.compression` config BEFORE the main runtime — with that config pointing at the summarizer that just failed, attempt 2 retried the identical route. The fallback attempt now pins the main route explicitly (`model`/`provider`/`base_url`/`api_key` when known).
+3. **A rescue could leave the conversation above the limit.** A huge preserved tail (one big tool result) stayed verbatim — a "rescued" 11K-token output for a 10K window just moved the 400 one turn later. Emergency mode now trims the oldest tail messages (re-sanitizing so pairing stays valid) until head + stub + tail fits ~95% of the window, and a post-assembly check logs an error if even head + stub cannot fit (system-prompt floor — nothing left to cut).
+
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).

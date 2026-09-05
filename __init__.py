@@ -605,14 +605,20 @@ class CompactEngine(ContextEngine):
         # must lose those calls here (unanswered tool_calls — 400). A tool in
         # head always has its parent assistant before it in head, so head
         # never loses messages; only tail can (plus stripped calls).
+        # Repair tool pairing INDEPENDENTLY on head and tail, before assembly.
+        # A transaction is preserved only when it lives entirely inside ONE
+        # side: a pair straddling the seam (assistant in head, result in
+        # tail — e.g. split parallel tool calls) is kept by a joint pass,
+        # and the summary message is then inserted BETWEEN pending
+        # tool_calls and their remaining results, which the API rejects.
+        # Each half of a straddling transaction is dropped (the transcript
+        # archive keeps the content). Head tools always have their parent
+        # assistant in head; tail tools whose parent sits in head or body
+        # are orphans relative to the emitted tail and are dropped;
+        # unanswered head calls are stripped.
+        head = self._sanitize_tool_pairs(head)
         if tail:
-            repaired = self._sanitize_tool_pairs(head + tail)
-            head, tail = repaired[:len(head)], repaired[len(head):]
-        else:
-            # preserve_last_n=0: the head alone must still be repaired — a
-            # head assistant whose tool results sit in the body would keep
-            # unanswered tool_calls (a protocol 400).
-            head = self._sanitize_tool_pairs(head)
+            tail = self._sanitize_tool_pairs(tail)
 
         if not body:
             logger.info("Compact: nothing to summarize (only head+tail), skipping")
@@ -653,6 +659,8 @@ class CompactEngine(ContextEngine):
             pass
 
         summary = None
+        emergency = False        # rescue mode: the output MUST fit the window
+        tail_removed = 0         # messages trimmed off the tail's front (rescue)
         last_err = "body unreadable in one pass by every candidate window"
         if not body_unreadable:
             logger.info(
@@ -693,6 +701,7 @@ class CompactEngine(ContextEngine):
             # transcript is ALREADY on disk — compact anyway with a stub
             # pointing at it. Failing open here means the next main call
             # 400s and the session dies.
+            emergency = True
             if not body_unreadable:
                 # An unreadable body is a configuration problem, not an LLM
                 # failure — don't pollute the backoff counter with it.
@@ -710,6 +719,27 @@ class CompactEngine(ContextEngine):
             logger.warning("Compact: LLM summary failed: %s — keeping messages unchanged", last_err)
             self._consecutive_failures += 1
             return messages
+
+        if emergency:
+            # The rescue contract is that the OUTPUT FITS. A huge preserved
+            # tail (one big tool result) can exceed the window on its own —
+            # trim oldest tail messages (re-sanitizing so tool pairing stays
+            # valid) until head + stub + tail fits ~95% of the window.
+            # Content cut here lives in the transcript archive. If even
+            # head+stub alone overflows, nothing more can be cut — the
+            # post-assembly check below reports it.
+            try:
+                budget = int(self.context_length * 0.95)
+                stub_tokens = estimate_messages_tokens_rough([{"role": "user", "content": summary}])
+                while tail and (
+                    estimate_messages_tokens_rough(head) + stub_tokens
+                    + estimate_messages_tokens_rough(tail) > budget
+                ):
+                    _prev_len = len(tail)
+                    tail = self._sanitize_tool_pairs(tail[1:])
+                    tail_removed += _prev_len - len(tail)
+            except Exception:
+                pass
 
         # Assemble the compressed message list
         compressed = []
@@ -773,7 +803,9 @@ class CompactEngine(ContextEngine):
         _tail_start = max(head_size, (n_messages - self.preserve_last_n)
                           if self.preserve_last_n > 0 else n_messages)
         _lu_in_head = last_user_idx is not None and last_user_idx < head_size
-        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start
+        # tail_removed: emergency trims cut the tail's front, shifting the
+        # surviving tail's start forward by that many ORIGINAL indices.
+        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start + tail_removed
         if tail or (last_user_msg is not None and not _lu_in_head and not _lu_in_tail):
             _next_role = (tail[0].get("role") if tail else None) or (last_user_msg.get("role") if last_user_msg else None)
             if _next_role == summary_role:
@@ -815,6 +847,21 @@ class CompactEngine(ContextEngine):
             n_messages, len(compressed),
             (1 - len(compressed) / max(n_messages, 1)) * 100,
         )
+
+        if emergency:
+            # Verify the rescue actually fits — a rescued output above the
+            # window just moves the 400 one turn later. The trim above should
+            # have handled the tail; if head + stub alone still exceeds the
+            # window, nothing more can be cut — report it.
+            try:
+                final_est = estimate_messages_tokens_rough(compressed)
+                if self.context_length > 0 and final_est > self.context_length:
+                    logger.error(
+                        "Compact: rescue output ~%d tokens still exceeds the context "
+                        "window (%d) — system prompt + head floor too large to shrink",
+                        final_est, self.context_length)
+            except Exception:
+                pass
 
         # Floor warning: if even the compacted list sits at/above the fire
         # threshold, the un-trimmable floor (system prompt + preserved head
@@ -869,7 +916,21 @@ class CompactEngine(ContextEngine):
                 body_tokens_est, summary_window,
             )
         if body_tokens_est <= self.context_length * 0.80:
-            attempts.append(dict(call_kwargs))  # main model via main_runtime
+            main_attempt = dict(call_kwargs)
+            # Pin the MAIN route explicitly. Without explicit args, call_llm
+            # resolves task='compression' from the auxiliary.compression
+            # config BEFORE the main runtime — with that config pointing at
+            # the same summarizer that just failed, the "fallback" would
+            # silently retry the identical route.
+            if self._model:
+                main_attempt["model"] = self._model
+            if self._provider:
+                main_attempt["provider"] = self._provider
+            if self._base_url:
+                main_attempt["base_url"] = self._base_url
+            if self._api_key:
+                main_attempt["api_key"] = self._api_key
+            attempts.append(main_attempt)  # main model, pinned when known
 
         summary = None
         last_err = "no attempt made"
