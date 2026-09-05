@@ -1,10 +1,12 @@
 """Functional test for the ZCode-replica compact-context plugin."""
+import copy
 import importlib.util
 import json
 import os
 import sys
 import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 
 REPO = os.environ.get("HERMES_REPO", os.path.expanduser("~/.hermes/hermes-agent"))
 PLUGIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "__init__.py")
@@ -861,7 +863,7 @@ for _p in paths39[1:]:
     e39._prune_old_transcripts()
 assert os.path.exists(paths39[0]), "[39] chain-root transcript was pruned (verbatim originals lost)"
 assert os.path.exists(paths39[3]), "[39] newest transcript missing"
-assert not os.path.exists(paths39[1]), "[39] middle archive not pruned under retention"
+assert "_consolidated_into" in json.loads(Path(paths39[1]).read_text()), "[39] middle archive not replaced with a redirect"
 print("[39] prune keeps newest N plus the chain root, scoped per session ✓")
 
 # 40. Zero-tail + completed answer: the previous user request is NOT
@@ -1056,7 +1058,7 @@ for gen in range(1, 5):
     paths46.append(_p)
     _time46.sleep(0.02)
 e46._prune_old_transcripts()
-assert not os.path.exists(paths46[1]), "[46] intermediate archive not pruned under retention"
+assert "_consolidated_into" in json.loads(Path(paths46[1]).read_text()), "[46] intermediate archive not replaced with a redirect"
 with open(paths46[0]) as _fh:  # chain root survives and carries gen-2's records
     _root46 = _fh.read()
 assert "EXCLUSIVE-GEN1-CONTENT" in _root46, "[46] chain root lost its own content"
@@ -1120,4 +1122,221 @@ finally:
     mod.call_llm = fake_call_llm
 print("[48] config ranges validated; threshold recomputed despite failed config load ✓")
 
-print("\nALL 48 CHECKS PASSED ✅")
+print("\nExisting 48 checks passed")
+
+# Review regressions use actual config loading and the complete compress() output.
+
+@contextmanager
+def _review_case(**config):
+    saved_cfg = FAKE_CONFIG["compact-context"].copy()
+    saved_llm = mod.call_llm
+    with tempfile.TemporaryDirectory(prefix="compact-review-") as directory:
+        FAKE_CONFIG["compact-context"].clear()
+        FAKE_CONFIG["compact-context"].update({
+            "target_tokens": 500, "preserve_first_n": 3, "preserve_last_n": 6,
+            "transcript_enabled": True, "transcript_dir": directory,
+            "transcript_retain": 1,
+        })
+        FAKE_CONFIG["compact-context"].update(config)
+        mod.call_llm = fake_call_llm
+        try:
+            yield mod.CompactEngine(context_length=10_000), Path(directory)
+        finally:
+            mod.call_llm = saved_llm
+            FAKE_CONFIG["compact-context"].clear()
+            FAKE_CONFIG["compact-context"].update(saved_cfg)
+
+def _review_history():
+    rows = [{"role": "system", "content": "System instructions"}]
+    for i in range(10):
+        rows += [{"role": "user", "content": f"question-{i}"},
+                 {"role": "assistant", "content": f"answer-{i}"}]
+    return rows
+
+def _assert_review_protocol(rows):
+    pending = set()
+    for i, row in enumerate(rows):
+        role = row["role"]
+        if i and role in ("user", "assistant"):
+            assert rows[i - 1]["role"] != role, "adjacent conversational roles"
+        if role == "tool":
+            assert row["tool_call_id"] in pending, "orphaned tool result"
+            pending.remove(row["tool_call_id"])
+        else:
+            assert not pending, "summary interrupted pending tool results"
+            pending = {c["id"] for c in row.get("tool_calls", [])}
+    assert not pending, "unanswered tool calls"
+
+def _review_session_isolation():
+    for sid_a, sid_b in (
+        ("alpha", "alpha_beta"),
+        ("x" * 24 + "a", "x" * 24 + "b"),
+        ("a/b", "a-b"),
+        (None, None),  # engines without a host session ID remain isolated
+    ):
+        with _review_case() as (a, directory):
+            a.on_session_start(sid_a)
+            a.compress(_review_history(), current_tokens=5000)
+            before = set(directory.glob("*.jsonl"))
+            b = mod.CompactEngine(context_length=10_000)
+            b.on_session_start(sid_b)
+            private = _review_history()
+            private[7]["content"] = "OTHER-SESSION-PRIVATE-DETAIL"
+            b.compress(private, current_tokens=5000)
+            b_files = set(directory.glob("*.jsonl")) - before
+            b_bytes = {p: p.read_bytes() for p in b_files}
+            a.compress(_review_history(), current_tokens=5000)
+            assert b_files, "second session did not create its own archive"
+            assert all(p.exists() and p.read_bytes() == data for p, data in b_bytes.items()), (
+                "retention modified another session's archive"
+            )
+            assert all("OTHER-SESSION-PRIVATE-DETAIL" not in p.read_text()
+                       for p in set(directory.glob("*.jsonl")) - b_files), (
+                "retention copied another session's content"
+            )
+
+def _review_archive_pointers():
+    with _review_case(preserve_last_n=2) as (engine, directory):
+        engine.on_session_start("pointer-session")
+        rows = _review_history()
+        paths = []
+        for generation in range(5):
+            rows += [{"role": "user", "content": f"EXACT-GENERATION-{generation}"}]
+            for i in range(4):
+                rows += [{"role": "assistant", "content": f"reply-{generation}-{i}"},
+                         {"role": "user", "content": f"next-{generation}-{i}"}]
+            before = set(directory.glob("*.jsonl"))
+            rows = engine.compress(rows, current_tokens=5000)
+            paths.extend(set(directory.glob("*.jsonl")) - before)
+        assert len(paths) == 5
+        recovered = ""
+        redirects = 0
+        for path in paths:
+            assert path.exists(), "a transcript pointer became dangling"
+            first = json.loads(path.read_text().splitlines()[0])
+            if "_consolidated_into" in first:
+                redirects += 1
+                target = Path(first["_consolidated_into"])
+                assert target.exists(), "redirect target does not exist"
+                recovered += target.read_text()
+            else:
+                recovered += path.read_text()
+        assert redirects >= 2, "intermediate archives were not consolidated"
+        for generation in range(5):
+            assert f"EXACT-GENERATION-{generation}" in recovered
+    # A failed atomic redirect replacement must leave the source readable.
+    from unittest.mock import patch
+    with _review_case() as (engine, directory):
+        engine.on_session_start("failed-redirect")
+        engine.compress(_review_history(), current_tokens=5000)
+        before = set(directory.glob("*.jsonl"))
+        engine.compress(_review_history(), current_tokens=5000)
+        middle = (set(directory.glob("*.jsonl")) - before).pop()
+        original = middle.read_bytes()
+        with patch.object(mod.os, "replace", side_effect=OSError("simulated replacement failure")):
+            engine.compress(_review_history(), current_tokens=5000)
+        assert middle.read_bytes() == original, "failed replacement destroyed the source"
+        assert not list(directory.glob(".compact-redirect-*")), "temporary redirect leaked"
+
+def _review_mixed_quotes():
+    fixtures = [
+        'password="abc\'defghijkl" PUBLIC',
+        'password="abcdefgh\'rest-of-secret" PUBLIC',
+        "'password': 'abc\"defghijkl' PUBLIC",
+        json.dumps({"password": 'abc"escaped-private-tail'}) + " PUBLIC",
+        "password='abc\\'escaped-private-tail' PUBLIC",
+    ]
+    with _review_case() as (engine, _):
+        for source in fixtures:
+            mod.call_llm = lambda source=source, **kw: FakeResponse(source)
+            out = engine.compress(_review_history(), current_tokens=5000)
+            summary = next(r["content"] for r in out if r.get("_compressed_summary"))
+            assert "defghijkl" not in summary and "rest-of-secret" not in summary
+            assert "private-tail" not in summary, "escaped quote leaked the suffix"
+            assert "[REDACTED]" in summary and "PUBLIC" in summary
+
+def _review_final_budget():
+    for position, short in ((2, False), (1, True), (-1, False)):
+        with _review_case() as (engine, directory):
+            rows = _review_history() if not short else _review_history()[:3]
+            rows[position]["content"] = "HUGE-ARCHIVED-DETAIL " + "X" * 42000
+            if position == -1:
+                rows.append({"role": "user", "content": "LATEST-REQUEST " + "Y" * 42000})
+            original = copy.deepcopy(rows)
+            out = engine.compress(rows, current_tokens=mod.estimate_messages_tokens_rough(rows))
+            assert mod.estimate_messages_tokens_rough(out) <= 8976, "final output exceeds budget"
+            assert out[0]["content"].startswith("System instructions")
+            assert rows == original, "input history was mutated"
+            assert engine.compression_count == 1
+            _assert_review_protocol(out)
+            archived = "".join(p.read_text() for p in directory.glob("*.jsonl"))
+            assert "HUGE-ARCHIVED-DETAIL" in archived
+            assert any("compaction_transcript_" in str(r.get("content", "")) for r in out)
+            if position == -1:
+                assert out[-1]["role"] == "user" and "LATEST-REQUEST" in out[-1]["content"]
+    with _review_case() as (engine, _):
+        rows = _review_history()
+        rows[0]["content"] = "SYSTEM MUST NOT BE TRUNCATED " + "Z" * 42000
+        original = copy.deepcopy(rows)
+        try:
+            engine.compress(rows, current_tokens=11000)
+        except ValueError as exc:
+            assert "system" in str(exc).lower()
+        else:
+            raise AssertionError("an impossible system floor was reported as a successful compaction")
+        assert rows == original and engine.compression_count == 0
+    with _review_case(transcript_enabled=False) as (engine, _):
+        rows = _review_history()
+        rows[2]["content"] = "NO ARCHIVE " + "X" * 42000
+        out = engine.compress(rows, current_tokens=11000)
+        assert out is rows, "unrecoverable content must fail open"
+        assert engine.compression_count == 0
+
+    for role, position in (("system", 5), ("developer", -2)):
+        with _review_case() as (engine, _):
+            rows = _review_history()
+            rows.insert(position, {"role": role, "content": "AUTHORITATIVE POLICY " + "Z" * 42000})
+            original = copy.deepcopy(rows)
+            try:
+                engine.compress(rows, current_tokens=11000)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("late authoritative instruction was discarded")
+            assert rows == original and engine.compression_count == 0
+        with _review_case() as (engine, _):
+            rows = _review_history()
+            rows.insert(position, {"role": role, "content": "KEEP THIS POLICY"})
+            out = engine.compress(rows, current_tokens=5000)
+            assert sum(r.get("content") == "KEEP THIS POLICY" for r in out) == 1
+            _assert_review_protocol(out)
+
+    for role, position in (("developer", -3), ("system", 2)):
+        with _review_case() as (engine, _):
+            rows = _review_history()
+            rows[position] = {"role": role, "content": "KEEP THIS POLICY"}
+            _assert_review_protocol(rows)
+            out = engine.compress(rows, current_tokens=5000)
+            assert sum(r.get("content") == "KEEP THIS POLICY" for r in out) == 1
+            _assert_review_protocol(out)
+
+    with _review_case(transcript_enabled=False) as (engine, _):
+        rows = _review_history()
+        rows[2]["content"] = "X" * 37000
+        for attempt in range(3):
+            assert engine.compress(rows, current_tokens=9400) is rows
+            assert engine._consecutive_failures == attempt + 1
+        assert not engine.should_compress(prompt_tokens=9400), "oversized output never backs off"
+
+_review_failures = []
+for _number, _check in enumerate((
+    _review_session_isolation, _review_archive_pointers,
+    _review_mixed_quotes, _review_final_budget,
+), 49):
+    try:
+        _check()
+        print(f"[{_number}] {_check.__name__} passed")
+    except AssertionError as exc:
+        _review_failures.append(f"[{_number}] {_check.__name__}: {exc}")
+assert not _review_failures, "\n".join(_review_failures)
+print("\nALL 52 CHECKS PASSED")

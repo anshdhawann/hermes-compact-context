@@ -57,7 +57,7 @@ python3 tests/test_compact_engine.py
 
 ## Hardening (v2.1)
 - `threshold_percent` is config-driven (was class-attr only).
-- `transcript_retain` keeps the N most recent transcript files (default 2) to bound disk usage.
+- `transcript_retain` keeps the newest N full snapshots (default 2), plus a consolidated history root and small redirect files; complete history is retained, so total bytes are not bounded.
 - Post-summary secret scrub is code-enforced (sk-*, sbp_*, gho_, Bearer, private keys, key=value) — not just a prompt instruction.
 - Body-too-large guard (80% of context_length) skips a turn when the body itself would overflow the summarizer.
 
@@ -117,6 +117,15 @@ Five verified findings (all reproduced on 480147e before fixing), checks [44]–
 3. **Retention consolidates instead of deleting middles.** Keeping the newest N plus the chain root only protected the FIRST generation: each intermediate archive holds the only verbatim copy of the turns summarized out of it at the next compaction, so pruning it punched silent holes in history. Pruned intermediates are now appended into the chain root (with a `_consolidated_from` marker) before unlinking; the root's mtime is restored so mtime-based ordering stays stable. A failed consolidation keeps the file — exceeding retention beats losing a generation.
 4. **Quoted secrets with spaces redact fully.** The v2.6.0 generalization matched values as whitespace-delimited tokens, regressing quoted-value support: `password="correct horse battery staple"` survived untouched (first word < 8 chars fails the match entirely); longer first words redacted only partially. Two ordered patterns now: quoted (through the CLOSING quote, spaces allowed) first, unquoted token second.
 5. **Config ranges validate; the threshold recomputes independent of config-load success.** `target_tokens: -100` used to flow all the way to `max_tokens=-150` in the summarizer request — `_int()` now takes lo/hi bounds and resets out-of-range values to defaults (all numeric settings). And `update_model()` recomputes the threshold BEFORE `_load_config()`: a failed load swallows its own exception, and its internal recompute used to be the only one — leaving a 200K threshold active on a 10K window after a model switch.
+
+## Recovery invariants (v2.6.2)
+
+- Session scope is a SHA-256 digest of the complete session ID, rather than a truncated/sanitized prefix. Before a session ID is available, each engine has a unique archive scope; reset creates a fresh scope. Legacy archives are not pruned by the new filename scheme.
+- Consolidation flushes the root before atomically replacing the old snapshot with a JSON redirect at the same path. The redirect names the absolute root path in `_consolidated_into`; a reader follows that path. Redirects are excluded from pruning. If replacement fails, the old snapshot remains; retry may duplicate archived records but cannot discard that generation.
+- Budget enforcement first trims an archived tail and shortens an oversized latest request. If protected non-system messages or the summary remain too large, it rebuilds with system/developer messages and an archive handoff. All input dictionaries remain unchanged. The latest user request remains a user message, with a full-text pointer when shortened.
+- If even the authoritative system/developer messages plus the handoff cannot fit, `compress()` raises `ValueError` without incrementing the compression count. This matches the inspected local Hermes host: `agent/conversation_compression.py` propagates dispatch exceptions before persistence. No archive or unavailable estimates cause an unchanged-history return instead of destructive trimming.
+- Quoted secret values are matched by their opening delimiter, including escaped quotes. An opposite quote within a password is part of the value; unquoted assignment redaction remains separate.
+- Regression checks exercise actual config loads and complete output, including session-prefix collisions, repeated consolidation, mixed/escaped quotes, short urgent histories, oversized preserved heads and latest requests, and impossible system floors. The suite runs offline with stubs and with actual Hermes classes/estimator; LLM calls remain mocked.
 
 ## Provenance notes
 

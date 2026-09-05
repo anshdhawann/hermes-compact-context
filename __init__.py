@@ -43,11 +43,13 @@ conversation. Recommended: a large-context model (e.g. GLM-5.2 @ 1M) or the
 main runtime model when it has a 1M window.
 """
 
+import hashlib
 import json
 import logging
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -164,7 +166,9 @@ _SECRET_PATTERNS = [
     # which the unquoted token pattern can never see (it stops at
     # whitespace, so it used to leak every word after the first, or miss
     # the value entirely when the first word was under 8 chars).
-    _re.compile(r'(?i)["\']?(api[_-]?key|secret|password|token|passwd|pwd)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']'),
+    # Match the opening quote, not either quote; escaped quotes belong to
+    # the secret too. Quoted values are explicit enough to scrub at any size.
+    _re.compile(r"""(?i)["']?(?:api[_-]?key|secret|password|token|passwd|pwd)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""),
     _re.compile(r'(?i)["\']?(api[_-]?key|secret|password|token|passwd|pwd)["\']?\s*[:=]\s*[^\s"\']{8,}'),
     _re.compile(r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}'),
 ]
@@ -184,7 +188,13 @@ def _est(messages: List[Dict[str, Any]]) -> Optional[int]:
 
 def _session_slug(session_id: Optional[str]) -> str:
     """Filesystem-safe prefix scoping transcript retention to one session."""
-    return _re.sub(r"[^A-Za-z0-9_-]", "-", session_id or "")[:24] or "shared"
+    return hashlib.sha256((session_id or "").encode("utf-8")).hexdigest()
+
+
+def _is_transcript_redirect(path: Path) -> bool:
+    """Redirects are small permanent pointers, not retention candidates."""
+    with path.open("rb") as f:
+        return f.read(len(b'{"_consolidated_into":')) == b'{"_consolidated_into":'
 
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -355,6 +365,7 @@ class CompactEngine(ContextEngine):
 
         # Transcript archive (ZCode replica)
         self._session_id: Optional[str] = None
+        self._archive_session_id = uuid.uuid4().hex
         self.transcript_enabled: bool = True
         self.transcript_dir: str = ""
         self.transcript_retain: int = DEFAULT_TRANSCRIPT_RETAIN
@@ -571,7 +582,7 @@ class CompactEngine(ContextEngine):
             # (or concurrent sessions sharing this fallback dir) must never
             # silently overwrite an earlier archive. The session id in the
             # prefix scopes retention pruning to THIS session's archives.
-            _sid = _session_slug(self._session_id)
+            _sid = _session_slug(self._session_id or self._archive_session_id)
             fd, unique_name = tempfile.mkstemp(
                 prefix=f"compaction_transcript_{_sid}_{int(time.time())}_", suffix=".jsonl", dir=str(base))
             path = Path(unique_name)
@@ -596,7 +607,7 @@ class CompactEngine(ContextEngine):
         transcript contains earlier history only as (summarizer-written)
         summary text, so pruning the root deletes the only verbatim copy of
         the earliest messages. Intermediate generations get the same
-        protection via CONSOLIDATION into the root before unlinking — each
+        protection via CONSOLIDATION into the root before redirecting — each
         holds the only verbatim copy of the turns summarized out of it
         next. Pruning is scoped to this session's filename prefix —
         concurrent sessions sharing a directory must not count each other's
@@ -609,16 +620,17 @@ class CompactEngine(ContextEngine):
             base = self._transcript_base()
             if not base.exists():
                 return
-            prefix = f"compaction_transcript_{_session_slug(self._session_id)}_"
+            prefix = f"compaction_transcript_{_session_slug(self._session_id or self._archive_session_id)}_"
             files = sorted(
-                (p for p in base.glob(TRANSCRIPT_GLOB) if p.name.startswith(prefix)),
+                (p for p in base.glob(TRANSCRIPT_GLOB)
+                 if p.name.startswith(prefix) and not _is_transcript_redirect(p)),
                 key=lambda p: p.stat().st_mtime,
             )
             if not files:
                 return
             # Keep the newest `retain` files PLUS the chain root.
             # Intermediate archives are CONSOLIDATED into the root before
-            # unlinking: each generation holds the only VERBATIM copy of the
+            # redirecting: each generation holds the only VERBATIM copy of the
             # turns that were summarized out of it at the next compaction
             # (later archives carry those turns only as summary text), so
             # plain deletion punched silent holes in session history. The
@@ -627,11 +639,7 @@ class CompactEngine(ContextEngine):
             for old in (f for f in files[:-retain] if f is not root):
                 if not self._consolidate_transcript(old, root):
                     continue  # keep the file rather than lose its content
-                try:
-                    old.unlink()
-                    logger.info("Compact: pruned old transcript %s", old)
-                except Exception:
-                    pass
+                logger.info("Compact: replaced old transcript with a redirect: %s", old)
         except Exception as e:
             logger.debug("Compact: transcript prune skipped: %s", e)
 
@@ -639,15 +647,13 @@ class CompactEngine(ContextEngine):
     def _consolidate_transcript(src: Path, root: Path) -> bool:
         """Append ``src``'s records into the chain-root archive.
 
-        Returns True when ``src``'s content is fully carried by ``root``
-        afterwards (the caller may unlink it). On any failure returns False
-        and leaves both files untouched — exceeding retention is safer than
-        losing the only verbatim copy of a generation.
+        After appending, atomically replace src with a readable redirect.
+        Existing summary pointers keep resolving, and redirects never become
+        consolidation candidates. A failed append or replacement retains src;
+        a retry may duplicate records in root but cannot lose the generation.
         """
         try:
             data = src.read_bytes()
-            if not data:
-                return True  # empty archive carries nothing
             root_stat = root.stat()
             with open(root, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
@@ -655,9 +661,25 @@ class CompactEngine(ContextEngine):
                     "note": "records below were consolidated from an older sibling archive",
                 }, ensure_ascii=False) + "\n")
                 f.write(data.decode("utf-8"))
+                f.flush()
+                os.fsync(f.fileno())
             # Restore the root's timestamps: ordering is mtime-based, and a
             # consolidation append must not relabel the root as "newest".
             os.utime(root, (root_stat.st_atime, root_stat.st_mtime))
+            fd, temporary = tempfile.mkstemp(prefix=".compact-redirect-", dir=str(src.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "_consolidated_into": str(root.resolve()),
+                        "note": "This transcript was consolidated. Read the file at _consolidated_into to recover its full records.",
+                    }, f, ensure_ascii=False)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary, src)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
             logger.info("Compact: consolidated %s into %s", src.name, root.name)
             return True
         except Exception as e:
@@ -691,15 +713,11 @@ class CompactEngine(ContextEngine):
         display_tokens = current_tokens if current_tokens else (
             self.last_prompt_tokens or (_est(messages) or 0)
         )
+        urgent = self.context_length > 0 and display_tokens >= self.context_length * 0.95
 
         # Determine head boundary
         head_size = self._compute_head_size(messages)
-        if n_messages <= head_size + 2:
-            if self.context_length > 0 and display_tokens >= self.context_length * 0.95:
-                logger.error(
-                    "Compact: urgent (%d tokens) but only %d messages exist — the head "
-                    "floor leaves nothing compaction can shrink; the session may overflow",
-                    display_tokens, n_messages)
+        if n_messages <= head_size + 2 and not urgent:
             logger.info("Compact: only %d messages, skipping", n_messages)
             return messages
 
@@ -713,6 +731,13 @@ class CompactEngine(ContextEngine):
 
         head = messages[:head_size]
         body = messages[head_size:body_end] if body_end is not None else messages[head_size:]
+        # Authoritative messages are never summarizable or trimmable, even
+        # when a host places them after the initial system prompt.
+        authoritative = ("system", "developer")
+        head = ([m for m in messages if m.get("role") in authoritative]
+                + [m for m in head if m.get("role") not in authoritative])
+        body = [m for m in body if m.get("role") not in authoritative]
+        tail = [m for m in tail if m.get("role") not in authoritative]
 
         # Repair tool pairing INDEPENDENTLY on head and tail, before assembly.
         # A transaction is preserved only when it lives entirely inside ONE
@@ -740,8 +765,6 @@ class CompactEngine(ContextEngine):
         )
         if transcript_path:
             self._prune_old_transcripts()
-
-        urgent = self.context_length > 0 and display_tokens >= self.context_length * 0.95
 
         # Nothing to summarize: skip — EXCEPT an urgent session, where the
         # mechanical rescue (stub + tail trim) is the only shrink left.
@@ -811,7 +834,6 @@ class CompactEngine(ContextEngine):
 
         summary = None
         emergency = False        # rescue mode: the output MUST fit the window
-        tail_removed = 0         # messages trimmed off the tail's front
         last_err = "request unreadable in one pass by every candidate window"
         if not body_unreadable and not rescue_only:
             logger.info(
@@ -825,7 +847,6 @@ class CompactEngine(ContextEngine):
         if summary is not None:
             # Code-enforced redaction (prompt says REDACT, but we enforce it)
             summary = _scrub_secrets(summary)
-            self._consecutive_failures = 0
         elif urgent and transcript_verified:
             # Mechanical rescue at the edge of overflow: the chain is down
             # (or the request is unreadable in one pass anywhere) but the
@@ -875,7 +896,7 @@ class CompactEngine(ContextEngine):
         else:
             budget = None
         compressed = self._assemble_output(
-            messages, head_size, head, tail, summary, transcript_path, tail_removed)
+            messages, head_size, head, tail, summary, transcript_path)
         if budget is not None and tail and not transcript_verified:
             _est0 = _est(compressed) or 0
             if _est0 > budget:
@@ -891,54 +912,28 @@ class CompactEngine(ContextEngine):
                 break
             _prev_len = len(tail)
             tail = self._sanitize_tool_pairs(tail[1:])
-            tail_removed += _prev_len - len(tail)
             logger.warning(
                 "Compact: output ~%d tokens over budget %d — trimmed %d preserved tail message(s)",
                 est, budget, _prev_len - len(tail))
             compressed = self._assemble_output(
-                messages, head_size, head, tail, summary, transcript_path, tail_removed)
+                messages, head_size, head, tail, summary, transcript_path)
 
-        # The trim loop can only shrink the TAIL. When it exhausts the tail
-        # and the output is still over budget, the overflow is the APPENDED
-        # LATEST USER MESSAGE (dropped out of the trimmed tail, then
-        # re-appended verbatim by assembly — an oversized request used to
-        # re-enter the output this way and bust the window). Truncate it to
-        # the remaining budget — but ONLY with a verified archive: the full
-        # text must stay recoverable, and the truncation note says where.
-        if budget is not None and transcript_verified and not tail:
-            _over = _est(compressed) or 0
-            if _over > budget and compressed:
-                _last = compressed[-1]
-                _lu = self._find_last_user_message(messages)
-                if (_last.get("role") == "user" and _lu is not None
-                        and _last.get("content") is _lu.get("content")):
-                    _user_tok = _est([_last]) or 0
-                    _allowed = budget - (_over - _user_tok)  # room left for the request
-                    if _allowed > 0:
-                        _note = (
-                            "\n\n[... This message was truncated by context compaction to "
-                            "fit the model's context window. The FULL original text is "
-                            "preserved in the session transcript at {p} — read that file "
-                            "to recover the rest before continuing.]".format(p=transcript_path)
-                        )
-                        _text = _content_text(_last.get("content", ""))
-                        # Rough estimators map ~4 chars to a token; keep a
-                        # margin, then verify against the same estimator and
-                        # shrink again if it still overshoots.
-                        _keep = max(200, _allowed * 4 - len(_note) - 200)
-                        for _ in range(4):
-                            _repl = dict(_last)
-                            _repl["content"] = _text[:_keep] + _note
-                            compressed = compressed[:-1] + [_repl]
-                            _est2 = _est(compressed)
-                            if _est2 is None or _est2 <= budget or _keep <= 200:
-                                break
-                            _keep = max(200, _keep - (_est2 - budget + 1) * 4)
-                        logger.warning(
-                            "Compact: latest user message ~%d tokens exceeded the remaining "
-                            "budget %d — truncated to ~%d chars (full text in transcript %s)",
-                            _user_tok, _allowed, _keep, transcript_path)
+        # A successful result must fit the complete request budget. When
+        # recovery is unavailable, fail open without claiming a compaction.
+        final_est = _est(compressed)
+        if budget is not None and (final_est is None or final_est > budget):
+            if not transcript_verified or final_est is None:
+                logger.error(
+                    "Compact: output exceeds the context window budget or cannot be "
+                    "measured; no verified transcript/estimate for further trimming "
+                    "— keeping messages unchanged")
+                self._consecutive_failures += 1
+                return messages
+            compressed = self._fit_archived_output(
+                messages, compressed, summary, transcript_path, budget)
 
+        if not emergency:
+            self._consecutive_failures = 0
         self.compression_count += 1
 
         logger.info(
@@ -946,22 +941,6 @@ class CompactEngine(ContextEngine):
             n_messages, len(compressed),
             (1 - len(compressed) / max(n_messages, 1)) * 100,
         )
-
-        # Final size postcondition — on EVERY path, not just rescues: if the
-        # complete output still exceeds the window, no legal cut remains
-        # (protected head, summary floor, un-archived content) and the next
-        # model call may 400 on overflow. Say so loudly instead of returning
-        # an oversized list silently.
-        final_est = _est(compressed)
-        if final_est is not None and self.context_length > 0 and final_est > self.context_length:
-            logger.error(
-                "Compact: final output ~%d tokens still exceeds the context window "
-                "(%d)%s — un-trimmable floor (system prompt + preserved head + "
-                "summary%s); the next model call may overflow",
-                final_est, self.context_length,
-                " after mechanical rescue" if emergency else "",
-                "" if transcript_verified else "; no verified archive to trim against",
-            )
 
         # Floor warning: if even the compacted list sits at/above the fire
         # threshold, the un-trimmable floor (system prompt + preserved head
@@ -981,6 +960,72 @@ class CompactEngine(ContextEngine):
             )
         return compressed
 
+    def _fit_archived_output(
+        self, messages: list[dict[str, Any]], compressed: list[dict[str, Any]],
+        summary: str, transcript_path: str, budget: int,
+    ) -> list[dict[str, Any]]:
+        """Fit archived history without cutting system/developer instructions.
+
+        First shorten an oversized latest request. If protected non-system
+        history or the summary itself is the floor, rebuild with the same
+        summary (then a small archive handoff). No input messages are mutated.
+        """
+        def fit(candidate):
+            estimate = _est(candidate)
+            if estimate is not None and estimate <= budget:
+                return candidate
+            if (not messages or messages[-1].get("role") != "user"
+                    or candidate[-1].get("role") != "user"
+                    or candidate[-1].get(COMPRESSED_SUMMARY_METADATA_KEY)):
+                return None
+            last = candidate[-1]
+            text = _content_text(last.get("content", ""))
+            note = (
+                "\n\n[This message was truncated by context compaction to fit the context window. "
+                "Read the FULL original text in the transcript before continuing: "
+                + transcript_path + "]"
+            )
+
+            def shortened(length):
+                return candidate[:-1] + [dict(last, content=text[:length] + note)]
+
+            minimum = _est(shortened(0))
+            if minimum is None or minimum > budget:
+                return None
+            low, high = 0, len(text)
+            while low < high:
+                middle = (low + high + 1) // 2
+                estimate = _est(shortened(middle))
+                if estimate is not None and estimate <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            return shortened(low)
+
+        fitted = fit(compressed)
+        if fitted is not None:
+            return fitted
+        protected = [m for m in messages if m.get("role") in ("system", "developer")]
+        recovery = (
+            "Preserved history was moved to the transcript to fit the context "
+            "window. Read the full transcript before continuing: " + transcript_path
+        )
+        for handoff in (summary + "\n\n" + recovery, recovery):
+            # All original conversational messages have moved to the archive;
+            # original head/tail indices must not suppress the latest request.
+            candidate = self._assemble_output(
+                messages, 0, protected, [], handoff, transcript_path)
+            fitted = fit(candidate)
+            if fitted is not None:
+                return fitted
+        # Hermes propagates engine failures before persisting the result.
+        # Never trim authoritative instructions or report an oversized success.
+        raise ValueError(
+            "Context compaction cannot fit system/developer instructions plus "
+            "the archive handoff in the context budget. Increase the model "
+            "window or reduce the system prompt."
+        )
+
     def _assemble_output(
         self,
         messages: List[Dict[str, Any]],
@@ -989,7 +1034,6 @@ class CompactEngine(ContextEngine):
         tail: List[Dict[str, Any]],
         summary: str,
         transcript_path: Optional[str],
-        tail_removed: int,
     ) -> List[Dict[str, Any]]:
         """Build the final compressed list from head + summary + tail.
 
@@ -997,7 +1041,6 @@ class CompactEngine(ContextEngine):
         enforcing the output budget. Owns the boundary marker, the positional
         last-user logic, and the summary prefix variant.
         """
-        n_messages = len(messages)
         compressed = []
         for i, msg in enumerate(head):
             m = msg.copy()
@@ -1018,19 +1061,17 @@ class CompactEngine(ContextEngine):
         last_head_role = head[-1].get("role", "user") if head else "user"
         summary_role = "assistant" if last_head_role == "user" else "user"
 
-        # Positional last-user membership (never dict-equality: two turns can
-        # carry identical content and both must survive). tail_removed shifts
-        # the surviving tail's start forward by that many original indices.
+        # Head membership uses the original index. Unmodified user messages
+        # retain object identity through sanitization, so tail membership
+        # remains exact even after removing tools or authoritative messages.
         last_user_msg = self._find_last_user_message(messages)
         last_user_idx = None
         for _i in range(len(messages) - 1, -1, -1):
             if messages[_i].get("role") == "user":
                 last_user_idx = _i
                 break
-        _tail_start = max(head_size, (n_messages - self.preserve_last_n)
-                          if self.preserve_last_n > 0 else n_messages)
         _lu_in_head = last_user_idx is not None and last_user_idx < head_size
-        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start + tail_removed
+        _lu_in_tail = any(m is last_user_msg for m in tail)
         tail_end_role = tail[-1].get("role") if tail else None
         session_ends_on_user = bool(messages) and messages[-1] is last_user_msg
 
@@ -1098,7 +1139,20 @@ class CompactEngine(ContextEngine):
 
         if append_last_user:
             compressed.append(last_user_msg.copy())
-        return compressed
+        # Moving a system/developer instruction to the protected prefix can
+        # expose two same-role messages in the preserved head or tail. Keep
+        # both verbatim and separate them as at the summary boundary.
+        alternating = []
+        for row in compressed:
+            role = row.get("role")
+            if (alternating and role in ("user", "assistant")
+                    and alternating[-1].get("role") == role):
+                alternating.append({
+                    "role": "assistant" if role == "user" else "user",
+                    "content": "[Compaction boundary between preserved messages.]",
+                })
+            alternating.append(row)
+        return alternating
 
     def _attempt_summary_chain(self, prompt: str, request_est: int) -> Tuple[Optional[str], str]:
         """Run the summarizer candidate chain. Returns (summary | None, last_err).
@@ -1238,7 +1292,7 @@ class CompactEngine(ContextEngine):
             elif m.get("role") == "tool":
                 if m.get("tool_call_id") not in active_call_ids:
                     continue
-            cleaned.append(m)
+            cleaned.append(m if m.get("role") == "assistant" else msg)
         return cleaned
 
     def update_model(
@@ -1281,6 +1335,7 @@ class CompactEngine(ContextEngine):
         self.compression_count = 0
         self._consecutive_failures = 0
         self._session_id = None
+        self._archive_session_id = uuid.uuid4().hex
 
 
 # -- Plugin Registration -----------------------------------------------------
