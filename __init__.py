@@ -174,6 +174,18 @@ def _scrub_secrets(s: str) -> str:
         s = pat.sub("[REDACTED]", s)
     return s
 
+def _est(messages: List[Dict[str, Any]]) -> Optional[int]:
+    """Token estimate, or None when the estimator itself blows up — every
+    caller treats None as "stop measuring, keep the safe default"."""
+    try:
+        return estimate_messages_tokens_rough(messages)
+    except Exception:
+        return None
+
+def _session_slug(session_id: Optional[str]) -> str:
+    """Filesystem-safe prefix scoping transcript retention to one session."""
+    return _re.sub(r"[^A-Za-z0-9_-]", "-", session_id or "")[:24] or "shared"
+
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 DEFAULT_TARGET_TOKENS = 7000
@@ -345,6 +357,7 @@ class CompactEngine(ContextEngine):
         self._session_id: Optional[str] = None
         self.transcript_enabled: bool = True
         self.transcript_dir: str = ""
+        self.transcript_retain: int = DEFAULT_TRANSCRIPT_RETAIN
 
         # Read compact config
         self.target_tokens: int = DEFAULT_TARGET_TOKENS
@@ -533,6 +546,15 @@ class CompactEngine(ContextEngine):
 
     # -- Transcript archive --------------------------------------------------
 
+    def _transcript_base(self) -> Path:
+        """Directory this session's archives live in — the ONE resolution
+        shared by write and prune, so the two can never disagree."""
+        if self.transcript_dir:
+            return Path(self.transcript_dir)
+        if self._session_id:
+            return Path.home() / ".hermes" / "sessions" / self._session_id
+        return Path.home() / ".hermes" / "cache" / "compaction_transcripts"
+
     def _write_transcript(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Write the full pre-compaction conversation to a JSONL transcript.
 
@@ -543,18 +565,13 @@ class CompactEngine(ContextEngine):
         if not self.transcript_enabled:
             return None
         try:
-            if self.transcript_dir:
-                base = Path(self.transcript_dir)
-            elif self._session_id:
-                base = Path.home() / ".hermes" / "sessions" / self._session_id
-            else:
-                base = Path.home() / ".hermes" / "cache" / "compaction_transcripts"
+            base = self._transcript_base()
             base.mkdir(parents=True, exist_ok=True)
             # Exclusive-create + unique name: two writes inside one second
             # (or concurrent sessions sharing this fallback dir) must never
             # silently overwrite an earlier archive. The session id in the
             # prefix scopes retention pruning to THIS session's archives.
-            _sid = _re.sub(r"[^A-Za-z0-9_-]", "-", self._session_id or "")[:24] or "shared"
+            _sid = _session_slug(self._session_id)
             fd, unique_name = tempfile.mkstemp(
                 prefix=f"compaction_transcript_{_sid}_{int(time.time())}_", suffix=".jsonl", dir=str(base))
             path = Path(unique_name)
@@ -572,7 +589,7 @@ class CompactEngine(ContextEngine):
             logger.warning("Compact: transcript write failed: %s", e)
             return None
 
-    def _prune_old_transcripts(self, current_path: Optional[str]) -> None:
+    def _prune_old_transcripts(self) -> None:
         """Keep the N most recent transcripts — plus the OLDEST one, always.
 
         The oldest archive is the root of the retrieval chain: every later
@@ -586,22 +603,13 @@ class CompactEngine(ContextEngine):
         archives against the retention limit.
         """
         try:
-            retain = getattr(self, "transcript_retain", DEFAULT_TRANSCRIPT_RETAIN)
+            retain = self.transcript_retain
             if retain <= 0:
                 return
-            # Resolve base dir from current_path or config
-            if current_path:
-                base = Path(current_path).parent
-            elif self.transcript_dir:
-                base = Path(self.transcript_dir)
-            elif self._session_id:
-                base = Path.home() / ".hermes" / "sessions" / self._session_id
-            else:
-                base = Path.home() / ".hermes" / "cache" / "compaction_transcripts"
+            base = self._transcript_base()
             if not base.exists():
                 return
-            _sid = _re.sub(r"[^A-Za-z0-9_-]", "-", self._session_id or "")[:24] or "shared"
-            prefix = f"compaction_transcript_{_sid}_"
+            prefix = f"compaction_transcript_{_session_slug(self._session_id)}_"
             files = sorted(
                 (p for p in base.glob(TRANSCRIPT_GLOB) if p.name.startswith(prefix)),
                 key=lambda p: p.stat().st_mtime,
@@ -681,7 +689,7 @@ class CompactEngine(ContextEngine):
         """
         n_messages = len(messages)
         display_tokens = current_tokens if current_tokens else (
-            self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+            self.last_prompt_tokens or (_est(messages) or 0)
         )
 
         # Determine head boundary
@@ -731,7 +739,7 @@ class CompactEngine(ContextEngine):
             and os.path.getsize(transcript_path) > 0
         )
         if transcript_path:
-            self._prune_old_transcripts(transcript_path)
+            self._prune_old_transcripts()
 
         urgent = self.context_length > 0 and display_tokens >= self.context_length * 0.95
 
@@ -869,10 +877,7 @@ class CompactEngine(ContextEngine):
         compressed = self._assemble_output(
             messages, head_size, head, tail, summary, transcript_path, tail_removed)
         if budget is not None and tail and not transcript_verified:
-            try:
-                _est0 = estimate_messages_tokens_rough(compressed)
-            except Exception:
-                _est0 = 0
+            _est0 = _est(compressed) or 0
             if _est0 > budget:
                 logger.warning(
                     "Compact: output ~%d tokens over budget %d, but trimming the preserved "
@@ -881,11 +886,8 @@ class CompactEngine(ContextEngine):
                     "session may overflow",
                     _est0, budget, self.transcript_enabled, transcript_path)
         while budget is not None and transcript_verified and tail:
-            try:
-                est = estimate_messages_tokens_rough(compressed)
-            except Exception:
-                break
-            if est <= budget:
+            est = _est(compressed)
+            if est is None or est <= budget:
                 break
             _prev_len = len(tail)
             tail = self._sanitize_tool_pairs(tail[1:])
@@ -904,19 +906,13 @@ class CompactEngine(ContextEngine):
         # the remaining budget — but ONLY with a verified archive: the full
         # text must stay recoverable, and the truncation note says where.
         if budget is not None and transcript_verified and not tail:
-            try:
-                _over = estimate_messages_tokens_rough(compressed)
-            except Exception:
-                _over = 0
+            _over = _est(compressed) or 0
             if _over > budget and compressed:
                 _last = compressed[-1]
                 _lu = self._find_last_user_message(messages)
                 if (_last.get("role") == "user" and _lu is not None
                         and _last.get("content") is _lu.get("content")):
-                    try:
-                        _user_tok = estimate_messages_tokens_rough([_last])
-                    except Exception:
-                        _user_tok = 0
+                    _user_tok = _est([_last]) or 0
                     _allowed = budget - (_over - _user_tok)  # room left for the request
                     if _allowed > 0:
                         _note = (
@@ -934,11 +930,8 @@ class CompactEngine(ContextEngine):
                             _repl = dict(_last)
                             _repl["content"] = _text[:_keep] + _note
                             compressed = compressed[:-1] + [_repl]
-                            try:
-                                _est2 = estimate_messages_tokens_rough(compressed)
-                            except Exception:
-                                break
-                            if _est2 <= budget or _keep <= 200:
+                            _est2 = _est(compressed)
+                            if _est2 is None or _est2 <= budget or _keep <= 200:
                                 break
                             _keep = max(200, _keep - (_est2 - budget + 1) * 4)
                         logger.warning(
@@ -959,19 +952,16 @@ class CompactEngine(ContextEngine):
         # (protected head, summary floor, un-archived content) and the next
         # model call may 400 on overflow. Say so loudly instead of returning
         # an oversized list silently.
-        try:
-            final_est = estimate_messages_tokens_rough(compressed)
-            if self.context_length > 0 and final_est > self.context_length:
-                logger.error(
-                    "Compact: final output ~%d tokens still exceeds the context window "
-                    "(%d)%s — un-trimmable floor (system prompt + preserved head + "
-                    "summary%s); the next model call may overflow",
-                    final_est, self.context_length,
-                    " after mechanical rescue" if emergency else "",
-                    "" if transcript_verified else "; no verified archive to trim against",
-                )
-        except Exception:
-            pass
+        final_est = _est(compressed)
+        if final_est is not None and self.context_length > 0 and final_est > self.context_length:
+            logger.error(
+                "Compact: final output ~%d tokens still exceeds the context window "
+                "(%d)%s — un-trimmable floor (system prompt + preserved head + "
+                "summary%s); the next model call may overflow",
+                final_est, self.context_length,
+                " after mechanical rescue" if emergency else "",
+                "" if transcript_verified else "; no verified archive to trim against",
+            )
 
         # Floor warning: if even the compacted list sits at/above the fire
         # threshold, the un-trimmable floor (system prompt + preserved head
@@ -979,19 +969,16 @@ class CompactEngine(ContextEngine):
         # compaction will re-trigger EVERY turn. Better caught here, on the
         # first compaction, than rediscovered from a log full of
         # "summarizing 1 turns" lines.
-        try:
-            out_tokens = estimate_messages_tokens_rough(compressed)
-            if self.threshold_tokens > 0 and out_tokens >= self.threshold_tokens:
-                logger.warning(
-                    "Compact: post-compaction size ~%d tokens still >= threshold %d — "
-                    "un-trimmable floor too large (system prompt + preserve_first_n=%d "
-                    "+ preserve_last_n=%d + summary); raise the threshold or lower "
-                    "preserve_* or compaction will re-trigger every turn",
-                    out_tokens, self.threshold_tokens,
-                    self.protect_first_n, self.preserve_last_n,
-                )
-        except Exception:
-            pass
+        out_tokens = _est(compressed)
+        if out_tokens is not None and self.threshold_tokens > 0 and out_tokens >= self.threshold_tokens:
+            logger.warning(
+                "Compact: post-compaction size ~%d tokens still >= threshold %d — "
+                "un-trimmable floor too large (system prompt + preserve_first_n=%d "
+                "+ preserve_last_n=%d + summary); raise the threshold or lower "
+                "preserve_* or compaction will re-trigger every turn",
+                out_tokens, self.threshold_tokens,
+                self.protect_first_n, self.preserve_last_n,
+            )
         return compressed
 
     def _assemble_output(

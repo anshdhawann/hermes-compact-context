@@ -858,7 +858,7 @@ paths39 = [e39._write_transcript(msgs_chain) for _ in range(4)]
 for _i, _p in enumerate(paths39):  # deterministic order despite same-second writes
     os.utime(_p, (1_700_000_000 + _i, 1_700_000_000 + _i))
 for _p in paths39[1:]:
-    e39._prune_old_transcripts(_p)
+    e39._prune_old_transcripts()
 assert os.path.exists(paths39[0]), "[39] chain-root transcript was pruned (verbatim originals lost)"
 assert os.path.exists(paths39[3]), "[39] newest transcript missing"
 assert not os.path.exists(paths39[1]), "[39] middle archive not pruned under retention"
@@ -1055,7 +1055,7 @@ for gen in range(1, 5):
     ])
     paths46.append(_p)
     _time46.sleep(0.02)
-e46._prune_old_transcripts(paths46[-1])
+e46._prune_old_transcripts()
 assert not os.path.exists(paths46[1]), "[46] intermediate archive not pruned under retention"
 with open(paths46[0]) as _fh:  # chain root survives and carries gen-2's records
     _root46 = _fh.read()
