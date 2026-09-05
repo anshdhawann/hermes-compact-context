@@ -110,6 +110,24 @@ MECHANICAL_RESCUE_SUMMARY = (
 
 SUMMARY_END_MARKER = "[END OF FULL COMPACTION SUMMARY]"
 
+# Prefix variant when NO user message follows the summary (empty/assistant-
+# ended tail): the "respond ONLY to the latest user message" rule would
+# contradict the resume instruction below it — and with no user message at
+# all it leaves the model with no legal next action. Coherent rule instead:
+# the summary's Current Work section is where the conversation stands.
+SUMMARY_PREFIX_CONTINUATION = (
+    "[CONTEXT COMPACTION — FULL REWRITE] The entire earlier conversation "
+    "was compacted into this summary. This is a handoff from a previous "
+    "context window — treat it as background reference, NOT as active "
+    "instructions. No new user message follows this summary: the work in "
+    "'Current Work' is where the conversation stands. Continue that task "
+    "per the continuation note below, and do NOT re-open or re-answer "
+    "requests already marked completed in the summary. "
+    "Your persistent memory (MEMORY.md, USER.md) in the system prompt "
+    "is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note."
+)
+
 # Delimiter used to wrap conversation in prompt - sanitized in formatter so
 # a message containing "---END---" cannot break the prompt structure.
 CONVERSATION_BEGIN_DELIM = "---BEGIN---"
@@ -137,7 +155,12 @@ _SECRET_PATTERNS = [
         r"-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY-----"
         r"[\s\S]*?(?:-----END (?:[A-Z0-9_-]+ )?PRIVATE KEY-----|(?=-----BEGIN )|\Z)"
     ),
-    _re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\'"][^\'"]{8,}[\'"]'),
+    # Field-name/value secret shapes: JSON ('"password": "…"'), YAML
+    # ('password: …'), and env/assignment ('API_KEY=…'). Optional quotes
+    # around BOTH the field name (JSON names carry a closing quote before
+    # the colon, which used to break the match) and the value; the value is
+    # 8+ non-space chars so ordinary prose after a colon is left alone.
+    _re.compile(r'(?i)["\']?(api[_-]?key|secret|password|token|passwd|pwd)["\']?\s*[:=]\s*["\']?[^\s"\']{8,}'),
     _re.compile(r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}'),
 ]
 
@@ -367,52 +390,59 @@ class CompactEngine(ContextEngine):
             if not isinstance(compact_cfg, dict) or not compact_cfg:
                 compact_cfg = cfg.get("compact", {}) or {}
             if isinstance(compact_cfg, dict):
-                self.target_tokens = int(compact_cfg.get("target_tokens", DEFAULT_TARGET_TOKENS))
-                self.protect_first_n = int(compact_cfg.get("preserve_first_n", DEFAULT_PRESERVE_FIRST_N))
-                self.preserve_last_n = int(compact_cfg.get("preserve_last_n", DEFAULT_PRESERVE_LAST_N))
+                # Every setting parses and validates INDEPENDENTLY: one bad
+                # value must not abort the whole load (a bad target_tokens
+                # once left a stale 200K threshold active after switching to
+                # a 10K window). Removed keys RESET — old values must not
+                # survive a reload.
+                def _int(key: str, default: int) -> int:
+                    try:
+                        return int(compact_cfg.get(key, default))
+                    except (TypeError, ValueError):
+                        return default
+
+                self.target_tokens = _int("target_tokens", DEFAULT_TARGET_TOKENS)
+                self.protect_first_n = _int("preserve_first_n", DEFAULT_PRESERVE_FIRST_N)
+                self.preserve_last_n = _int("preserve_last_n", DEFAULT_PRESERVE_LAST_N)
+                self.transcript_retain = _int("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN)
+                self.threshold_tokens_cfg = _int("threshold_tokens", 0)
+                self._summary_context_length = _int("summary_context_length", 0)
                 self.transcript_enabled = bool(compact_cfg.get("transcript_enabled", True))
                 self.transcript_dir = str(compact_cfg.get("transcript_dir", "") or "")
+
                 # Tunable trigger; was previously a hardcoded class attr (0.20).
                 # Explicit = key present AND valid (0.05-0.95). The membership
                 # check matters: get()'s default (0.20) also passes the range
                 # check, which used to mark the percent "explicit" on every
                 # config load and silently cap fixed-only thresholds to
-                # min(fixed, 20% of window).
-                self._explicit_percent = False
+                # min(fixed, 20% of window). Absent/invalid resets to default.
+                tp_parsed = None
                 if "threshold_percent" in compact_cfg:
                     try:
                         tp = float(compact_cfg["threshold_percent"])
                         if 0.05 <= tp <= 0.95:
-                            self.threshold_percent = tp
-                            self._explicit_percent = True
+                            tp_parsed = tp
                     except (TypeError, ValueError):
                         pass
-                try:
-                    self.transcript_retain = int(compact_cfg.get("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN))
-                except (TypeError, ValueError):
-                    self.transcript_retain = DEFAULT_TRANSCRIPT_RETAIN
-                # Fixed trigger: absolute token count that overrides the
-                # percent rule (0 = off). Validated in _recompute_threshold.
-                try:
-                    self.threshold_tokens_cfg = int(compact_cfg.get("threshold_tokens", 0) or 0)
-                except (TypeError, ValueError):
-                    self.threshold_tokens_cfg = 0
-                # Recompute threshold after config load
-                self._recompute_threshold()
+                self.threshold_percent = (
+                    tp_parsed if tp_parsed is not None else DEFAULT_THRESHOLD_PERCENT
+                )
+                self._explicit_percent = tp_parsed is not None
+
                 # Dedicated summarizer model for this engine. If set, it
                 # overrides the main agent's model when summarizing — needed
                 # because the summarizer must read the FULL conversation in
                 # one pass, so it needs a window large enough (e.g. GLM-5.2 @ 1M).
-                cfg_model = compact_cfg.get("model")
-                cfg_provider = compact_cfg.get("provider")
-                if cfg_model:
-                    self._summary_model = cfg_model
-                if cfg_provider:
-                    self._summary_provider = cfg_provider
-                try:
-                    self._summary_context_length = int(compact_cfg.get("summary_context_length", 0) or 0)
-                except (TypeError, ValueError):
-                    self._summary_context_length = 0
+                # Assigned unconditionally so REMOVING the key takes effect.
+                cfg_model = str(compact_cfg.get("model") or "").strip()
+                cfg_provider = str(compact_cfg.get("provider") or "").strip()
+                self._summary_model = cfg_model or None
+                self._summary_provider = cfg_provider or None
+
+                # ALWAYS recompute — a model switch may have changed the
+                # window, and the threshold must never go stale mid-session.
+                self._recompute_threshold()
+
                 logger.info(
                     "Compact engine config: target_tokens=%d, preserve_first_n=%d, "
                     "preserve_last_n=%d, threshold_percent=%.2f, threshold_tokens_cfg=%d "
@@ -508,9 +538,11 @@ class CompactEngine(ContextEngine):
             base.mkdir(parents=True, exist_ok=True)
             # Exclusive-create + unique name: two writes inside one second
             # (or concurrent sessions sharing this fallback dir) must never
-            # silently overwrite an earlier archive.
+            # silently overwrite an earlier archive. The session id in the
+            # prefix scopes retention pruning to THIS session's archives.
+            _sid = _re.sub(r"[^A-Za-z0-9_-]", "-", self._session_id or "")[:24] or "shared"
             fd, unique_name = tempfile.mkstemp(
-                prefix=f"compaction_transcript_{int(time.time())}_", suffix=".jsonl", dir=str(base))
+                prefix=f"compaction_transcript_{_sid}_{int(time.time())}_", suffix=".jsonl", dir=str(base))
             path = Path(unique_name)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 for msg in messages:
@@ -527,7 +559,15 @@ class CompactEngine(ContextEngine):
             return None
 
     def _prune_old_transcripts(self, current_path: Optional[str]) -> None:
-        """Keep only the N most recent transcript files."""
+        """Keep the N most recent transcripts — plus the OLDEST one, always.
+
+        The oldest archive is the root of the retrieval chain: every later
+        transcript contains earlier history only as (summarizer-written)
+        summary text, so pruning the root deletes the only verbatim copy of
+        the earliest messages. Pruning is scoped to this session's filename
+        prefix — concurrent sessions sharing a directory must not count each
+        other's archives against the retention limit.
+        """
         try:
             retain = getattr(self, "transcript_retain", DEFAULT_TRANSCRIPT_RETAIN)
             if retain <= 0:
@@ -543,9 +583,16 @@ class CompactEngine(ContextEngine):
                 base = Path.home() / ".hermes" / "cache" / "compaction_transcripts"
             if not base.exists():
                 return
-            files = sorted(base.glob(TRANSCRIPT_GLOB), key=lambda p: p.stat().st_mtime)
-            # Keep newest `retain` files
-            for old in files[:-retain]:
+            _sid = _re.sub(r"[^A-Za-z0-9_-]", "-", self._session_id or "")[:24] or "shared"
+            prefix = f"compaction_transcript_{_sid}_"
+            files = sorted(
+                (p for p in base.glob(TRANSCRIPT_GLOB) if p.name.startswith(prefix)),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if not files:
+                return
+            # Keep the newest `retain` files PLUS the oldest (chain root).
+            for old in (f for f in files[:-retain] if f is not files[0]):
                 try:
                     old.unlink()
                     logger.info("Compact: pruned old transcript %s", old)
@@ -583,6 +630,11 @@ class CompactEngine(ContextEngine):
         # Determine head boundary
         head_size = self._compute_head_size(messages)
         if n_messages <= head_size + 2:
+            if self.context_length > 0 and display_tokens >= self.context_length * 0.95:
+                logger.error(
+                    "Compact: urgent (%d tokens) but only %d messages exist — the head "
+                    "floor leaves nothing compaction can shrink; the session may overflow",
+                    display_tokens, n_messages)
             logger.info("Compact: only %d messages, skipping", n_messages)
             return messages
 
@@ -597,14 +649,6 @@ class CompactEngine(ContextEngine):
         head = messages[:head_size]
         body = messages[head_size:body_end] if body_end is not None else messages[head_size:]
 
-        # Repair tool pairing across the head/tail boundary BEFORE assembly:
-        # (a) a tail tool whose calling assistant was summarized into the body
-        # must not influence the boundary-marker decision and only then get
-        # deleted (that left the summary adjacent to a same-role message —
-        # 400), and (b) a head assistant whose tool results fell into the body
-        # must lose those calls here (unanswered tool_calls — 400). A tool in
-        # head always has its parent assistant before it in head, so head
-        # never loses messages; only tail can (plus stripped calls).
         # Repair tool pairing INDEPENDENTLY on head and tail, before assembly.
         # A transaction is preserved only when it lives entirely inside ONE
         # side: a pair straddling the seam (assistant in head, result in
@@ -620,39 +664,81 @@ class CompactEngine(ContextEngine):
         if tail:
             tail = self._sanitize_tool_pairs(tail)
 
-        if not body:
-            logger.info("Compact: nothing to summarize (only head+tail), skipping")
-            return messages
-
-        # Archive the FULL conversation before it is summarized away.
+        # Archive the FULL conversation before anything is summarized away —
+        # and VERIFY the archive: the mechanical rescue is only allowed to
+        # remove content when a working recovery source actually exists.
         transcript_path = self._write_transcript(messages)
+        transcript_verified = bool(
+            transcript_path
+            and os.path.isfile(transcript_path)
+            and os.path.getsize(transcript_path) > 0
+        )
         if transcript_path:
             self._prune_old_transcripts(transcript_path)
 
-        # Guard: the summarizer must read the whole body in ONE pass. Skip
-        # when the body exceeds ~80% of the best window in the candidate
-        # chain — EXCEPT at >=95% of the window, where returning unchanged
-        # means the next main call 400s on overflow: route into the
-        # mechanical rescue instead (the transcript is already on disk by
-        # this point).
-        body_tokens_est = 0
+        urgent = self.context_length > 0 and display_tokens >= self.context_length * 0.95
+
+        # Nothing to summarize: skip — EXCEPT an urgent session, where the
+        # mechanical rescue (stub + tail trim) is the only shrink left.
+        rescue_only = False
+        if not body:
+            if urgent and transcript_verified:
+                logger.warning(
+                    "Compact: no body to summarize but session is urgent (%d tokens) — mechanical rescue",
+                    display_tokens)
+                rescue_only = True
+            else:
+                logger.info("Compact: nothing to summarize (only head+tail), skipping")
+                return messages
+
+        # Format the body and measure the ACTUAL request before guarding:
+        # the formatter truncates tool outputs, so raw-message estimates
+        # overstate what the summarizer must read (a tool-storm body once
+        # guard-skipped compaction while its formatted prompt was ~1K tokens).
+        conversation_text = _format_conversation_for_summary(body)
+
+        # Build the summarization prompt
+        focus_note = ""
+        if focus_topic:
+            focus_note = (
+                f"\nADDITIONAL SUMMARIZATION INSTRUCTIONS (user-supplied):\n"
+                f"Focus topic: \"{focus_topic}\"\n"
+                f"This compaction should PRIORITISE preserving all information "
+                f"related to the focus topic above, while still capturing the "
+                f"other required sections."
+            )
+
+        prompt = ZCODE_SUMMARY_PROMPT.format(
+            target_tokens=self.target_tokens,
+            focus_note=focus_note,
+            conversation_text=conversation_text,
+        )
+        output_reserve = int(self.target_tokens * 1.5)
+        try:
+            request_est = len(prompt) // 4 + output_reserve
+        except Exception:
+            request_est = 0
+
+        # Guard: the summarizer must read the whole REQUEST in ONE pass.
+        # Skip when it exceeds ~80% of the best window in the candidate
+        # chain — EXCEPT when urgent, where returning unchanged means the
+        # next main call 400s on overflow: route into the rescue instead.
         body_unreadable = False
         try:
-            body_tokens_est = estimate_messages_tokens_rough(body)
             guard_window = max(self.context_length, self._summary_window())
             guard_limit = int(guard_window * 0.80)
-            if body_tokens_est > guard_limit:
-                if display_tokens >= self.context_length * 0.95:
+            if request_est > guard_limit:
+                if urgent:
                     body_unreadable = True
                     logger.warning(
-                        "Compact: body ~%d tokens exceeds every candidate window "
+                        "Compact: request ~%d tokens exceeds every candidate window "
                         "(guard %d) at %d tokens — mechanical rescue",
-                        body_tokens_est, guard_limit, display_tokens,
+                        request_est, guard_limit, display_tokens,
                     )
                 else:
                     logger.warning(
-                        "Compact: body ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
-                        body_tokens_est, guard_limit, guard_window,
+                        "Compact: request ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
+                        request_est, guard_limit, guard_window,
                     )
                     return messages
         except Exception:
@@ -660,185 +746,83 @@ class CompactEngine(ContextEngine):
 
         summary = None
         emergency = False        # rescue mode: the output MUST fit the window
-        tail_removed = 0         # messages trimmed off the tail's front (rescue)
-        last_err = "body unreadable in one pass by every candidate window"
-        if not body_unreadable:
+        tail_removed = 0         # messages trimmed off the tail's front
+        last_err = "request unreadable in one pass by every candidate window"
+        if not body_unreadable and not rescue_only:
             logger.info(
                 "Compact triggered (%d tokens >= %d threshold): "
                 "summarizing %d turns into ~%d tokens (head=%d, tail=%d)",
                 display_tokens, self.threshold_tokens,
                 len(body), self.target_tokens, len(head), len(tail),
             )
-
-            conversation_text = _format_conversation_for_summary(body)
-
-            # Build the summarization prompt
-            focus_note = ""
-            if focus_topic:
-                focus_note = (
-                    f"\nADDITIONAL SUMMARIZATION INSTRUCTIONS (user-supplied):\n"
-                    f"Focus topic: \"{focus_topic}\"\n"
-                    f"This compaction should PRIORITISE preserving all information "
-                    f"related to the focus topic above, while still capturing the "
-                    f"other required sections."
-                )
-
-            prompt = ZCODE_SUMMARY_PROMPT.format(
-                target_tokens=self.target_tokens,
-                focus_note=focus_note,
-                conversation_text=conversation_text,
-            )
-
-            summary, last_err = self._attempt_summary_chain(prompt, body_tokens_est)
+            summary, last_err = self._attempt_summary_chain(prompt, request_est)
 
         if summary is not None:
             # Code-enforced redaction (prompt says REDACT, but we enforce it)
             summary = _scrub_secrets(summary)
             self._consecutive_failures = 0
-        elif display_tokens >= self.context_length * 0.95:
-            # Mechanical rescue at the edge of overflow: the LLM chain is
-            # down (or the body is unreadable in one pass anywhere) but the
-            # transcript is ALREADY on disk — compact anyway with a stub
-            # pointing at it. Failing open here means the next main call
-            # 400s and the session dies.
+        elif urgent and transcript_verified:
+            # Mechanical rescue at the edge of overflow: the chain is down
+            # (or the request is unreadable in one pass anywhere) but the
+            # transcript is VERIFIED on disk — compact with a stub pointing
+            # at it. Failing open here means the next main call 400s.
             emergency = True
             if not body_unreadable:
-                # An unreadable body is a configuration problem, not an LLM
-                # failure — don't pollute the backoff counter with it.
+                # An unreadable request is a configuration problem, not an
+                # LLM failure — don't pollute the backoff counter with it.
                 self._consecutive_failures += 1
                 logger.warning(
                     "Compact: summarizer chain failed near the context limit (%s) — "
                     "mechanical rescue, full transcript at %s",
-                    last_err, transcript_path or "(archive unavailable)",
+                    last_err, transcript_path,
                 )
-            summary = MECHANICAL_RESCUE_SUMMARY.format(
-                path=transcript_path or
-                "(transcript unavailable — older turns could not be archived)",
-            )
+            summary = MECHANICAL_RESCUE_SUMMARY.format(path=transcript_path)
+        elif urgent:
+            # No verified archive: rescuing would DELETE content with no
+            # recovery path. A visible overflow failure is better than
+            # silent, unrecoverable data loss.
+            logger.error(
+                "Compact: urgent (%d tokens) with the summarizer down and no verified "
+                "transcript archive (transcript_enabled=%s, path=%s) — keeping messages "
+                "unchanged rather than destroying unrecoverable content",
+                display_tokens, self.transcript_enabled, transcript_path)
+            if not body_unreadable:
+                self._consecutive_failures += 1
+            return messages
         else:
             logger.warning("Compact: LLM summary failed: %s — keeping messages unchanged", last_err)
             self._consecutive_failures += 1
             return messages
 
-        if emergency:
-            # The rescue contract is that the OUTPUT FITS. A huge preserved
-            # tail (one big tool result) can exceed the window on its own —
-            # trim oldest tail messages (re-sanitizing so tool pairing stays
-            # valid) until head + stub + tail fits ~95% of the window.
-            # Content cut here lives in the transcript archive. If even
-            # head+stub alone overflows, nothing more can be cut — the
-            # post-assembly check below reports it.
+        # Assemble, then ENFORCE the budget on the COMPLETE assembled output
+        # (summary wrappers, boundary marker, appended user message included
+        # — pre-assembly part sums undershot the real size). Applies to
+        # EVERY path: successful summaries, rescues, everything — a
+        # compacted conversation that still exceeds the window just moves
+        # the 400 one turn later. Trimmed tail content lives in the
+        # transcript archive.
+        if self.context_length > 0:
+            _reserve = min(4096, max(1024, self.context_length // 10))
+            budget = max(1, self.context_length - _reserve)
+        else:
+            budget = None
+        compressed = self._assemble_output(
+            messages, head_size, head, tail, summary, transcript_path, tail_removed)
+        while budget is not None and tail:
             try:
-                budget = int(self.context_length * 0.95)
-                stub_tokens = estimate_messages_tokens_rough([{"role": "user", "content": summary}])
-                while tail and (
-                    estimate_messages_tokens_rough(head) + stub_tokens
-                    + estimate_messages_tokens_rough(tail) > budget
-                ):
-                    _prev_len = len(tail)
-                    tail = self._sanitize_tool_pairs(tail[1:])
-                    tail_removed += _prev_len - len(tail)
+                est = estimate_messages_tokens_rough(compressed)
             except Exception:
-                pass
-
-        # Assemble the compressed message list
-        compressed = []
-        for i, msg in enumerate(head):
-            m = msg.copy()
-            # Append compaction note to system prompt
-            if i == 0 and m.get("role") == "system":
-                note = (
-                    "\n\n[Note: The conversation history has been fully compacted. "
-                    "A comprehensive summary replaces all prior turns. "
-                    "Your persistent memory (MEMORY.md, USER.md) remains fully authoritative.]"
-                )
-                existing = _content_text(m.get("content", ""))
-                if note not in existing:
-                    if isinstance(m.get("content"), str):
-                        m["content"] = existing + note
-            compressed.append(m)
-
-        # Determine summary role (avoid consecutive same-role)
-        last_head_role = head[-1].get("role", "user") if head else "user"
-        summary_role = "assistant" if last_head_role == "user" else "user"
-
-        summary_text = SUMMARY_PREFIX + "\n\n" + summary + "\n\n" + SUMMARY_END_MARKER
-        if transcript_path:
-            summary_text += TRANSCRIPT_NOTE_TEMPLATE.format(path=transcript_path)
-        if tail:
-            summary_text += RECENT_PRESERVED_NOTE
-        summary_text += RESUME_NOTE
-
-        compressed.append({
-            "role": summary_role,
-            "content": summary_text,
-            COMPRESSED_SUMMARY_METADATA_KEY: True,
-            # Persist the summary invisible in every transcript surface
-            # (the desktop renderer maps display_kind='hidden' to null),
-            # while it stays in the model's context — mirrors ZCode's
-            # "model sees compacted context, UI shows the archive".
-            # archive_and_compact() inserts rows as-is, so this stamp
-            # must live on the dict itself.
-            "display_kind": "hidden",
-        })
-
-        # Maintain strict role alternation across the compaction boundary.
-        # The summary role is chosen opposite to head[-1]; if the message that
-        # follows (tail[0] or the last user message) would repeat it, insert a
-        # synthetic user boundary marker so the API never sees two same-role
-        # messages in a row.
-        # Locate the last user message once, up front — it is used both for
-        # the boundary check here and appended at the end if not already
-        # preserved in head/tail. (Previously assigned only after this point,
-        # which crashed on empty-tail sessions.)
-        # Membership is POSITIONAL, never dict-equality: `x not in head`
-        # compares contents, so a repeated message (a second "continue")
-        # whose earlier twin lives in the head was silently dropped.
-        last_user_msg = self._find_last_user_message(messages)
-        last_user_idx = None
-        for _i in range(len(messages) - 1, -1, -1):
-            if messages[_i].get("role") == "user":
-                last_user_idx = _i
                 break
-        _tail_start = max(head_size, (n_messages - self.preserve_last_n)
-                          if self.preserve_last_n > 0 else n_messages)
-        _lu_in_head = last_user_idx is not None and last_user_idx < head_size
-        # tail_removed: emergency trims cut the tail's front, shifting the
-        # surviving tail's start forward by that many ORIGINAL indices.
-        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start + tail_removed
-        if tail or (last_user_msg is not None and not _lu_in_head and not _lu_in_tail):
-            _next_role = (tail[0].get("role") if tail else None) or (last_user_msg.get("role") if last_user_msg else None)
-            if _next_role == summary_role:
-                compressed.append({
-                    # The marker sits between the summary and the next message,
-                    # both of which carry summary_role — so the marker must take
-                    # the OPPOSITE role, or the API sees three same-role messages.
-                    "role": "assistant" if summary_role == "user" else "user",
-                    "content": (
-                        "[Compaction boundary: the summary above replaces the earlier "
-                        "conversation; the messages below are preserved recent history. "
-                        "Continue with the task.]"
-                    ),
-                })
-
-        # Append the recent tail verbatim. Head and tail are disjoint slices
-        # (tail_start >= head_size by construction), so no dedup is needed —
-        # and the old content-equality dedup DROPPED legitimate repeated
-        # messages whose twin happened to live in the head.
-        for tm in tail:
-            compressed.append(tm.copy())
-
-        # Append the last user message only when it repairs the list or the
-        # session genuinely ends on it. After an assistant answer it would
-        # read as a fresh re-ask of an already-completed task; ending on the
-        # assistant's reply is valid and lets the model continue instead.
-        # (tail ending on a dangling tool MUST still get the append — a bare
-        # trailing tool message is a protocol 400.)
-        if last_user_msg is not None and not _lu_in_head and not _lu_in_tail:
-            tail_end_role = tail[-1].get("role") if tail else None
-            session_ends_on_user = bool(messages) and messages[-1] is last_user_msg
-            if session_ends_on_user or tail_end_role in (None, "tool"):
-                compressed.append(last_user_msg.copy())
+            if est <= budget:
+                break
+            _prev_len = len(tail)
+            tail = self._sanitize_tool_pairs(tail[1:])
+            tail_removed += _prev_len - len(tail)
+            logger.warning(
+                "Compact: output ~%d tokens over budget %d — trimmed %d preserved tail message(s)",
+                est, budget, _prev_len - len(tail))
+            compressed = self._assemble_output(
+                messages, head_size, head, tail, summary, transcript_path, tail_removed)
 
         self.compression_count += 1
 
@@ -884,13 +868,135 @@ class CompactEngine(ContextEngine):
             pass
         return compressed
 
-    def _attempt_summary_chain(self, prompt: str, body_tokens_est: int) -> Tuple[Optional[str], str]:
+    def _assemble_output(
+        self,
+        messages: List[Dict[str, Any]],
+        head_size: int,
+        head: List[Dict[str, Any]],
+        tail: List[Dict[str, Any]],
+        summary: str,
+        transcript_path: Optional[str],
+        tail_removed: int,
+    ) -> List[Dict[str, Any]]:
+        """Build the final compressed list from head + summary + tail.
+
+        Pure assembly (no trimming) — compress() calls this repeatedly while
+        enforcing the output budget. Owns the boundary marker, the positional
+        last-user logic, and the summary prefix variant.
+        """
+        n_messages = len(messages)
+        compressed = []
+        for i, msg in enumerate(head):
+            m = msg.copy()
+            # Append compaction note to system prompt
+            if i == 0 and m.get("role") == "system":
+                note = (
+                    "\n\n[Note: The conversation history has been fully compacted. "
+                    "A comprehensive summary replaces all prior turns. "
+                    "Your persistent memory (MEMORY.md, USER.md) remains fully authoritative.]"
+                )
+                existing = _content_text(m.get("content", ""))
+                if note not in existing:
+                    if isinstance(m.get("content"), str):
+                        m["content"] = existing + note
+            compressed.append(m)
+
+        # Determine summary role (avoid consecutive same-role)
+        last_head_role = head[-1].get("role", "user") if head else "user"
+        summary_role = "assistant" if last_head_role == "user" else "user"
+
+        # Positional last-user membership (never dict-equality: two turns can
+        # carry identical content and both must survive). tail_removed shifts
+        # the surviving tail's start forward by that many original indices.
+        last_user_msg = self._find_last_user_message(messages)
+        last_user_idx = None
+        for _i in range(len(messages) - 1, -1, -1):
+            if messages[_i].get("role") == "user":
+                last_user_idx = _i
+                break
+        _tail_start = max(head_size, (n_messages - self.preserve_last_n)
+                          if self.preserve_last_n > 0 else n_messages)
+        _lu_in_head = last_user_idx is not None and last_user_idx < head_size
+        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start + tail_removed
+        tail_end_role = tail[-1].get("role") if tail else None
+        session_ends_on_user = bool(messages) and messages[-1] is last_user_msg
+
+        # Append the last user message ONLY when the original session ends on
+        # it, or to repair a tail ending on a dangling tool. With an empty
+        # tail after a completed assistant answer it would read as a fresh
+        # re-ask of finished work (duplicate side effects) — the summary's
+        # continuation note governs instead.
+        append_last_user = (
+            last_user_msg is not None
+            and not _lu_in_head and not _lu_in_tail
+            and (session_ends_on_user or tail_end_role == "tool")
+        )
+
+        # Prefix variant: when a user message FOLLOWS the summary, "respond
+        # only to the latest user message" is the rule; when none does, that
+        # instruction would contradict the resume note (and leave the model
+        # no legal next action) — use the continuation form instead.
+        user_follows = any(m.get("role") == "user" for m in tail) or append_last_user
+        prefix = SUMMARY_PREFIX if user_follows else SUMMARY_PREFIX_CONTINUATION
+
+        summary_text = prefix + "\n\n" + summary + "\n\n" + SUMMARY_END_MARKER
+        if transcript_path:
+            summary_text += TRANSCRIPT_NOTE_TEMPLATE.format(path=transcript_path)
+        if tail:
+            summary_text += RECENT_PRESERVED_NOTE
+        summary_text += RESUME_NOTE
+
+        compressed.append({
+            "role": summary_role,
+            "content": summary_text,
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            # Persist the summary invisible in every transcript surface
+            # (the desktop renderer maps display_kind='hidden' to null),
+            # while it stays in the model's context — mirrors ZCode's
+            # "model sees compacted context, UI shows the archive".
+            # archive_and_compact() inserts rows as-is, so this stamp
+            # must live on the dict itself.
+            "display_kind": "hidden",
+        })
+
+        # Maintain strict role alternation across the compaction boundary.
+        # The summary role is chosen opposite to head[-1]; if the message that
+        # follows (tail[0] or the last user message) would repeat it, insert a
+        # synthetic boundary marker so the API never sees two same-role
+        # messages in a row. The marker takes the OPPOSITE role of the two
+        # same-role neighbours it separates.
+        if tail or (last_user_msg is not None and not _lu_in_head and not _lu_in_tail):
+            _next_role = (tail[0].get("role") if tail else None) or (last_user_msg.get("role") if last_user_msg else None)
+            if _next_role == summary_role:
+                compressed.append({
+                    "role": "assistant" if summary_role == "user" else "user",
+                    "content": (
+                        "[Compaction boundary: the summary above replaces the earlier "
+                        "conversation; the messages below are preserved recent history. "
+                        "Continue with the task.]"
+                    ),
+                })
+
+        # Append the recent tail verbatim. Head and tail are disjoint slices
+        # (tail_start >= head_size by construction), so no dedup is needed —
+        # content-equality dedup once DROPPED legitimate repeated messages.
+        for tm in tail:
+            compressed.append(tm.copy())
+
+        if append_last_user:
+            compressed.append(last_user_msg.copy())
+        return compressed
+
+    def _attempt_summary_chain(self, prompt: str, request_est: int) -> Tuple[Optional[str], str]:
         """Run the summarizer candidate chain. Returns (summary | None, last_err).
 
         Dedicated summarizer first (when configured AND its known window can
-        hold the body in one pass), then the MAIN model via main_runtime —
-        a summarizer too small for the body is skipped outright, and a
+        hold the REQUEST in one pass), then the MAIN model via main_runtime —
+        a summarizer too small for the request is skipped outright, and a
         summarizer failure falls back to main instead of failing open.
+        ``request_est`` is the ESTIMATE OF THE ACTUAL FORMATTED REQUEST plus
+        its reserved output tokens (the formatter truncates tool outputs, so
+        raw-message estimates overstate what the summarizer must read).
         """
         call_kwargs = {
             "task": "compression",
@@ -906,22 +1012,24 @@ class CompactEngine(ContextEngine):
         }
         summary_window = self._summary_window()
         attempts = []
-        if self._summary_model and (summary_window <= 0 or body_tokens_est <= summary_window * 0.80):
+        if self._summary_model and (summary_window <= 0 or request_est <= summary_window * 0.80):
             attempts.append(dict(call_kwargs, model=self._summary_model))
             if self._summary_provider:
                 attempts[-1]["provider"] = self._summary_provider
         elif self._summary_model:
             logger.info(
-                "Compact: body ~%d exceeds summarizer window %d — going straight to the main model",
-                body_tokens_est, summary_window,
+                "Compact: request ~%d exceeds summarizer window %d — going straight to the main model",
+                request_est, summary_window,
             )
-        if body_tokens_est <= self.context_length * 0.80:
+        if request_est <= self.context_length * 0.80:
             main_attempt = dict(call_kwargs)
             # Pin the MAIN route explicitly. Without explicit args, call_llm
             # resolves task='compression' from the auxiliary.compression
             # config BEFORE the main runtime — with that config pointing at
             # the same summarizer that just failed, the "fallback" would
-            # silently retry the identical route.
+            # silently retry the identical route. api_mode too: the resolver
+            # otherwise takes the auxiliary config's mode (e.g.
+            # anthropic_messages) over the main runtime's chat_completions.
             if self._model:
                 main_attempt["model"] = self._model
             if self._provider:
@@ -930,6 +1038,8 @@ class CompactEngine(ContextEngine):
                 main_attempt["base_url"] = self._base_url
             if self._api_key:
                 main_attempt["api_key"] = self._api_key
+            if self._api_mode:
+                main_attempt["api_mode"] = self._api_mode
             attempts.append(main_attempt)  # main model, pinned when known
 
         summary = None
@@ -939,16 +1049,25 @@ class CompactEngine(ContextEngine):
             try:
                 with aux_interrupt_protection():
                     response = call_llm(**attempt_kwargs)
-                candidate = response.choices[0].message.content
+                choice = response.choices[0]
+                candidate = choice.message.content
+                finish = getattr(choice, "finish_reason", None)
                 if candidate and candidate.strip():
-                    summary = candidate
-                    if i > 0:
-                        logger.info(
-                            "Compact: main-model fallback succeeded after %s failed",
-                            attempts[0].get("model", "main"),
-                        )
-                    break
-                last_err = f"{label}: empty summary"
+                    if finish == "length":
+                        # Truncated mid-generation (partial <analysis> block):
+                        # NOT a usable summary — treat as a failure so the
+                        # fallback gets a chance.
+                        last_err = f"{label}: truncated (finish_reason=length)"
+                    else:
+                        summary = candidate
+                        if i > 0:
+                            logger.info(
+                                "Compact: main-model fallback succeeded after %s failed",
+                                attempts[0].get("model", "main"),
+                            )
+                        break
+                else:
+                    last_err = f"{label}: empty summary"
             except Exception as e:
                 last_err = f"{label}: {e}"
             logger.info("Compact: summarizer %s failed (%s)", label, last_err)

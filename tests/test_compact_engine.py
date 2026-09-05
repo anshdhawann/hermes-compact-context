@@ -737,4 +737,215 @@ for i in range(1, len(out33)):
 mod.call_llm = fake_call_llm
 print(f"[33] rescue trims the tail until output fits (~{est33} tokens), roles={[m['role'] for m in out33]} ✓")
 
-print("\nALL 33 CHECKS PASSED ✅")
+# -- v2.6.0: Astra round 3 ----------------------------------------------------
+
+# 34. JSON-syntax and unquoted secrets are redacted (the closing quote
+# between field name and colon used to break the match).
+blob34a = '"password": "correct-horse-battery-staple"'
+blob34b = '"api_key": "custom-secret-123456789"'
+blob34c = "API_KEY=env-secret-value-987654321"
+for blob34, gone34 in ((blob34a, "correct-horse-battery-staple"),
+                       (blob34b, "custom-secret-123456789"),
+                       (blob34c, "env-secret-value-987654321")):
+    out34 = mod._scrub_secrets(blob34)
+    assert gone34 not in out34, f"[34] secret survived: {gone34!r} in {out34!r}"
+print("[34] JSON/unquoted secret assignments fully redacted ✓")
+
+# 35. finish_reason='length' is NOT a usable summary: a truncated response
+# falls through to the fallback instead of replacing history mid-thought.
+class _ChoiceFR:
+    def __init__(self, content, finish):
+        self.message = type("M", (), {"content": content})()
+        self.finish_reason = finish
+def _resp_fr(content, finish):
+    return type("R", (), {"choices": [_ChoiceFR(content, finish)]})()
+_calls35 = []
+def _trunc_llm35(**kwargs):
+    _calls35.append(kwargs)
+    if kwargs.get("model") == "stub/sum-model":
+        return _resp_fr("## <analysis> partial thou", "length")
+    return _resp_fr("## Goal\nFull summary", "stop")
+_cc["model"] = "stub/sum-model"
+e35 = mod.CompactEngine(context_length=1_000_000)
+e35.transcript_enabled = False
+mod.call_llm = _trunc_llm35
+out35 = e35.compress(msgs_chain, current_tokens=250_000)
+assert len(_calls35) == 2, f"[35] truncated summary must fall back, attempts={len(_calls35)}"
+assert any("Full summary" in str(m.get("content", "")) for m in out35), "[35] fallback summary missing"
+assert e35._consecutive_failures == 0
+def _all_trunc_llm(**kwargs):
+    return _resp_fr("## <analysis> still partial", "length")
+mod.call_llm = _all_trunc_llm
+e35b = mod.CompactEngine(context_length=1_000_000)
+e35b.transcript_enabled = False
+out35b = e35b.compress(msgs_chain, current_tokens=250_000)
+assert out35b is msgs_chain and e35b._consecutive_failures == 1, "[35] all-truncated must fail open"
+del _cc["model"]
+mod.call_llm = fake_call_llm
+print("[35] finish_reason=length rejected; falls back or fails open ✓")
+
+# 36. Config reloads are complete: removed keys RESET, and one invalid value
+# must not abort the load (a bad target_tokens once left a stale 200K
+# threshold after switching to a 10K window).
+_cc["model"] = "stub/sum-model"
+e36 = mod.CompactEngine(context_length=1_000_000)
+del _cc["model"]
+e36._load_config()
+assert e36._summary_model is None, "[36] removed model key must reset on reload"
+_cc["threshold_percent"] = 0.8
+e36b = mod.CompactEngine(context_length=1_000_000)
+del _cc["threshold_percent"]
+e36b._load_config()
+assert e36b.threshold_tokens == 200_000 and e36b._explicit_percent is False, (
+    f"[36] removed percent must revert to default: {e36b.threshold_tokens}"
+)
+_cc["target_tokens"] = "garbage"
+_cc["threshold_tokens"] = 300000
+e36c = mod.CompactEngine(context_length=1_000_000)
+assert e36c.target_tokens == 7000, f"[36] invalid target_tokens must default: {e36c.target_tokens}"
+e36c.update_model("m", context_length=10_000)
+assert e36c.threshold_tokens == 2000, (
+    f"[36] threshold not recomputed after window switch: {e36c.threshold_tokens}"
+)
+del _cc["target_tokens"], _cc["threshold_tokens"]
+print("[36] config reloads: removals reset, per-key validation, threshold always recomputed ✓")
+
+# 37. The main fallback pins api_mode too (the resolver otherwise takes the
+# auxiliary config's mode over the main runtime's).
+_calls37 = []
+def _pin_llm37(**kwargs):
+    _calls37.append(kwargs)
+    if kwargs.get("model") == "stub/sum-model":
+        raise RuntimeError("down")
+    return FakeResponse("## Goal\nMode pinned")
+_cc["model"] = "stub/sum-model"
+e37 = mod.CompactEngine(context_length=1_000_000)
+e37.update_model(model="real-main", provider="main-prov", base_url="https://main.example",
+                 api_key="mk", api_mode="chat_completions", context_length=1_000_000)
+mod.call_llm = _pin_llm37
+e37.compress(msgs_chain, current_tokens=250_000)
+assert len(_calls37) == 2 and _calls37[1].get("api_mode") == "chat_completions", (
+    f"[37] fallback api_mode not pinned: {_calls37[1].get('api_mode')}"
+)
+del _cc["model"]
+mod.call_llm = fake_call_llm
+print("[37] main fallback pins model/provider/base_url/api_key/api_mode ✓")
+
+# 38. No verified transcript -> NO rescue: urgent + dead chain with archives
+# disabled keeps messages (deleting content with no recovery path is worse
+# than a visible overflow).
+def _dead_llm38(**kwargs):
+    raise RuntimeError("down")
+e38 = mod.CompactEngine(context_length=200_000)
+e38.transcript_enabled = False
+mod.call_llm = _dead_llm38
+out38 = e38.compress(msgs_chain, current_tokens=int(200_000 * 0.96))
+assert out38 is msgs_chain, "[38] rescue must be refused without a verified archive"
+assert e38._consecutive_failures == 1
+assert not any("Compaction fallback notice" in str(m.get("content", "")) for m in out38)
+mod.call_llm = fake_call_llm
+print("[38] urgent failure with no archive fails open instead of destroying content ✓")
+
+# 39. Pruning keeps the chain root: the OLDEST transcript (only verbatim
+# copy of the earliest messages) survives retention; scoping is per session.
+e39 = mod.CompactEngine(context_length=1_000_000)
+e39.on_session_start("t-prune")
+e39.transcript_enabled = True
+e39.transcript_dir = tempfile.mkdtemp(prefix="compact-prune-")
+paths39 = [e39._write_transcript(msgs_chain) for _ in range(4)]
+for _i, _p in enumerate(paths39):  # deterministic order despite same-second writes
+    os.utime(_p, (1_700_000_000 + _i, 1_700_000_000 + _i))
+for _p in paths39[1:]:
+    e39._prune_old_transcripts(_p)
+assert os.path.exists(paths39[0]), "[39] chain-root transcript was pruned (verbatim originals lost)"
+assert os.path.exists(paths39[3]), "[39] newest transcript missing"
+assert not os.path.exists(paths39[1]), "[39] middle archive not pruned under retention"
+print("[39] prune keeps newest N plus the chain root, scoped per session ✓")
+
+# 40. Zero-tail + completed answer: the previous user request is NOT
+# re-appended as a re-ask (it re-triggered completed work).
+msgs40 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2-final-q"}, {"role": "assistant", "content": "a2-done"},
+]
+out40 = _fresh_engine(preserve_last_n=0).compress(msgs40, current_tokens=250_000)
+assert not (out40[-1]["role"] == "user" and out40[-1].get("content") == "u2-final-q"), (
+    f"[40] completed request re-asked: last={out40[-1]}"
+)
+for i in range(1, len(out40)):
+    assert out40[i]["role"] != out40[i-1]["role"], (
+        f"[40] alternation broken at {i}: {out40[i-1]['role']}->{out40[i]['role']}"
+    )
+print(f"[40] zero-tail completed session: no re-ask, roles={[m['role'] for m in out40]} ✓")
+
+# 41. Coherent continuation instructions: with NO user message after the
+# summary the "respond ONLY to the latest user message" prefix would
+# contradict the resume note — the continuation variant is used instead.
+summ41 = [m for m in out40 if m.get(mod.COMPRESSED_SUMMARY_METADATA_KEY)]
+assert summ41, "[41] summary message not found"
+assert "Respond ONLY" not in summ41[0]["content"], "[41] contradictory prefix used with no following user"
+assert "No new user message follows" in summ41[0]["content"], "[41] continuation prefix missing"
+summ27 = [m for m in out27 if m.get(mod.COMPRESSED_SUMMARY_METADATA_KEY)]
+assert summ27 and "Respond ONLY" in summ27[0]["content"], (
+    "[41] classic prefix must be kept when a user message DOES follow"
+)
+print("[41] prefix variant matches whether a user message follows the summary ✓")
+
+# 42. Budget enforcement applies to SUCCESSFUL compactions too, measured on
+# the COMPLETE assembled output (wrappers and appended messages included).
+# Window is 20K: the REQUEST (~12K incl. output reserve) passes the 16K
+# guard, but the huge preserved tail busts the 18K budget -> trimmed.
+e42 = mod.CompactEngine(context_length=20_000)  # budget = 18000 after headroom
+e42.transcript_enabled = False
+msgs42 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"},
+    {"role": "assistant", "tool_calls": [{"id": "big42", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}], "content": ""},
+    {"role": "tool", "tool_call_id": "big42", "content": "T" * 200_000},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+]
+out42 = e42.compress(msgs42, current_tokens=15_000)  # NOT urgent — success path
+est42 = mod.estimate_messages_tokens_rough(out42)
+assert est42 <= 18_000, f"[42] successful compaction over budget: ~{est42} tokens"
+assert not any("TTTT" in str(m.get("content", "")) for m in out42), "[42] oversized tail not trimmed"
+assert e42._consecutive_failures == 0, "[42] success path must reset failures"
+for i in range(1, len(out42)):
+    assert out42[i]["role"] != out42[i-1]["role"], (
+        f"[42] alternation broken at {i}: {out42[i-1]['role']}->{out42[i]['role']}"
+    )
+print(f"[42] success path enforces the output budget (~{est42} tokens) ✓")
+
+# 43. The guard measures the FORMATTED request: a body whose raw tool output
+# crosses the guard still compacts when the formatter truncates it small.
+_calls43 = []
+def _tap43(**kwargs):
+    _calls43.append(kwargs)
+    return FakeResponse("## Goal\nFormatted guard OK")
+e43 = mod.CompactEngine(context_length=200_000)  # raw guard alone = 160K
+e43.transcript_enabled = False
+mod.call_llm = _tap43
+msgs43 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"},
+    {"role": "assistant", "tool_calls": [{"id": "t43", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}], "content": ""},
+    {"role": "tool", "tool_call_id": "t43", "content": "X" * 800_000},  # ~200K raw, truncated to ~1K
+    {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+]
+out43 = e43.compress(msgs43, current_tokens=250_000)
+assert len(_calls43) >= 1, "[43] formatted-small request was guard-skipped"
+assert any("Formatted guard OK" in str(m.get("content", "")) for m in out43), "[43] compaction missing"
+mod.call_llm = fake_call_llm
+print(f"[43] guard measures the formatted request ({len(_calls43)} attempt made) ✓")
+
+print("\nALL 43 CHECKS PASSED ✅")

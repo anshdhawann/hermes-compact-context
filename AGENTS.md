@@ -42,6 +42,14 @@ is the design, not an accident — preserve it.
    inside the window, and any auxiliary-LLM call meant to hit a DIFFERENT
    model than the aux-config default must pin its route explicitly
    (`call_llm` resolves `auxiliary.{task}.*` before the main runtime).
+5e. Size invariants are enforced on the FINAL assembled artifact (measure
+   the complete output, never a part sum — wrappers and appended messages
+   once pushed rescues over the window). Guards measure what will actually
+   be sent (the formatted request + output reserve), not raw inputs.
+   Destructive fallbacks require a VERIFIED recovery source (rescue without
+   a checked archive fails open). Config reloads reset removed keys and
+   validate per-key — one bad value must never abort a load and leave a
+   stale threshold behind.
 6. Behavior change → bump `version:` in `plugin.yaml` in the same commit.
 7. **Never simplify away:** graceful degradation (LLM failure → messages
    unchanged), the secret scrub, strict role alternation, and the failure
