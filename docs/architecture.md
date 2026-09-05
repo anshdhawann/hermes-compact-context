@@ -83,6 +83,14 @@ The summarizer call is now a candidate CHAIN, and the failure mode degrades in s
 
 Design cross-check: the rescue shape (shrink-and-retry near overflow instead of fail-open) and the aux→main fallback are patterned on Codex's overflow handling; Codex's `BodyAfterPrefix` trigger scoping and recompact-on-model-change were evaluated and rejected (our threshold recomputes on `update_model()` already, and the floor problem is guarded by the warning above).
 
+## Fixes (v2.5.1 — Astra review)
+Five verified findings, each with a regression check ([26]–[30]):
+1. **The overflow guard bypassed the rescue.** A body exceeding 80% of every candidate window returned messages unchanged even at 96% session usage — the mechanical rescue was unreachable exactly when needed. The guard now routes oversized bodies into the rescue at ≥95% of the window (and does not count it as an LLM failure — no call was attempted); below the urgency line it still skips.
+2. **Repeated messages silently disappeared.** The tail dedup (`tm not in head`) compared dict CONTENT, not position — a recent "continue" whose early twin sat in the head was dropped (breaking alternation and losing a live instruction). Head/tail are disjoint slices by construction, so the dedup is simply gone; last-user-message membership is now positional (index-based), never equality-based.
+3. **`preserve_last_n: 0` skipped tool-pair repair.** Sanitization ran only under `if tail:` — a head assistant whose tool results were summarized away kept unanswered `tool_calls` (protocol 400). The head is now sanitized on its own when the tail is empty.
+4. **PKCS#8 keys survived redaction.** The regex required a type word (`RSA`/`EC`/...) before `PRIVATE KEY`, so plain `-----BEGIN PRIVATE KEY-----` passed intact, and truncated typed blocks kept their base64 body after the header was removed. The pattern now makes the type optional in BEGIN and END, and an unterminated block redacts through to the next `-----BEGIN` line or end of input (over-redaction is safe; leakage is not).
+5. **Transcript filenames could collide.** One-second timestamps opened in `w` mode: two writes within a second (or concurrent sessions sharing the fallback dir) silently overwrote an archive. Writes now use `tempfile.mkstemp` (timestamp prefix + unique suffix, exclusive create).
+
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).

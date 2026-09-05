@@ -46,9 +46,10 @@ main runtime model when it has a 1M window.
 import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.auxiliary_client import call_llm, aux_interrupt_protection
 from agent.context_engine import ContextEngine
@@ -127,7 +128,15 @@ _SECRET_PATTERNS = [
     # Full block (header through footer) for any key type: RSA, EC, DSA,
     # OPENSSH, ENCRYPTED. The optional-footer form still redacts the header
     # alone when a block is truncated mid-key.
-    _re.compile(r"-----BEGIN [A-Z0-9_-]+ PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9_-]+ PRIVATE KEY-----)?"),
+    _re.compile(
+        # Any private-key block, typed (RSA/EC/OPENSSH/ENCRYPTED...) or plain
+        # PKCS#8 ("BEGIN PRIVATE KEY" — no type word). An unterminated block
+        # (truncated by an earlier cut) is redacted through to the next
+        # "-----BEGIN" line or end of input — over-redacting is safe here,
+        # leaking key material is not.
+        r"-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY-----"
+        r"[\s\S]*?(?:-----END (?:[A-Z0-9_-]+ )?PRIVATE KEY-----|(?=-----BEGIN )|\Z)"
+    ),
     _re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\'"][^\'"]{8,}[\'"]'),
     _re.compile(r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}'),
 ]
@@ -497,8 +506,13 @@ class CompactEngine(ContextEngine):
             else:
                 base = Path.home() / ".hermes" / "cache" / "compaction_transcripts"
             base.mkdir(parents=True, exist_ok=True)
-            path = base / f"compaction_transcript_{int(time.time())}.jsonl"
-            with open(path, "w", encoding="utf-8") as f:
+            # Exclusive-create + unique name: two writes inside one second
+            # (or concurrent sessions sharing this fallback dir) must never
+            # silently overwrite an earlier archive.
+            fd, unique_name = tempfile.mkstemp(
+                prefix=f"compaction_transcript_{int(time.time())}_", suffix=".jsonl", dir=str(base))
+            path = Path(unique_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 for msg in messages:
                     record = {}
                     for key in ("role", "content", "tool_calls", "tool_name",
@@ -594,6 +608,11 @@ class CompactEngine(ContextEngine):
         if tail:
             repaired = self._sanitize_tool_pairs(head + tail)
             head, tail = repaired[:len(head)], repaired[len(head):]
+        else:
+            # preserve_last_n=0: the head alone must still be repaired — a
+            # head assistant whose tool results sit in the body would keep
+            # unanswered tool_calls (a protocol 400).
+            head = self._sanitize_tool_pairs(head)
 
         if not body:
             logger.info("Compact: nothing to summarize (only head+tail), skipping")
@@ -606,98 +625,63 @@ class CompactEngine(ContextEngine):
 
         # Guard: the summarizer must read the whole body in ONE pass. Skip
         # when the body exceeds ~80% of the best window in the candidate
-        # chain — a dedicated summarizer with a KNOWN bigger window relaxes
-        # this guard; a known smaller one is routed around per-attempt below.
+        # chain — EXCEPT at >=95% of the window, where returning unchanged
+        # means the next main call 400s on overflow: route into the
+        # mechanical rescue instead (the transcript is already on disk by
+        # this point).
         body_tokens_est = 0
+        body_unreadable = False
         try:
             body_tokens_est = estimate_messages_tokens_rough(body)
             guard_window = max(self.context_length, self._summary_window())
             guard_limit = int(guard_window * 0.80)
             if body_tokens_est > guard_limit:
-                logger.warning(
-                    "Compact: body ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
-                    body_tokens_est, guard_limit, guard_window,
-                )
-                return messages
+                if display_tokens >= self.context_length * 0.95:
+                    body_unreadable = True
+                    logger.warning(
+                        "Compact: body ~%d tokens exceeds every candidate window "
+                        "(guard %d) at %d tokens — mechanical rescue",
+                        body_tokens_est, guard_limit, display_tokens,
+                    )
+                else:
+                    logger.warning(
+                        "Compact: body ~%d tokens exceeds guard (%d = 80%% of %d) — skipping this turn",
+                        body_tokens_est, guard_limit, guard_window,
+                    )
+                    return messages
         except Exception:
             pass
 
-        logger.info(
-            "Compact triggered (%d tokens >= %d threshold): "
-            "summarizing %d turns into ~%d tokens (head=%d, tail=%d)",
-            display_tokens, self.threshold_tokens,
-            len(body), self.target_tokens, len(head), len(tail),
-        )
-
-        conversation_text = _format_conversation_for_summary(body)
-
-        # Build the summarization prompt
-        focus_note = ""
-        if focus_topic:
-            focus_note = (
-                f"\nADDITIONAL SUMMARIZATION INSTRUCTIONS (user-supplied):\n"
-                f"Focus topic: \"{focus_topic}\"\n"
-                f"This compaction should PRIORITISE preserving all information "
-                f"related to the focus topic above, while still capturing the "
-                f"other required sections."
-            )
-
-        prompt = ZCODE_SUMMARY_PROMPT.format(
-            target_tokens=self.target_tokens,
-            focus_note=focus_note,
-            conversation_text=conversation_text,
-        )
-
-        # Candidate chain: dedicated summarizer first (when configured AND its
-        # known window can hold the body in one pass), then the MAIN model as
-        # fallback — a summarizer too small for the body is skipped outright,
-        # and a summarizer failure falls back to main instead of failing open.
-        call_kwargs = {
-            "task": "compression",
-            "main_runtime": {
-                "model": self._model,
-                "provider": self._provider,
-                "base_url": self._base_url,
-                "api_key": self._api_key,
-                "api_mode": self._api_mode,
-            },
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": int(self.target_tokens * 1.5),
-        }
-        summary_window = self._summary_window()
-        attempts = []
-        if self._summary_model and (summary_window <= 0 or body_tokens_est <= summary_window * 0.80):
-            attempts.append(dict(call_kwargs, model=self._summary_model))
-            if self._summary_provider:
-                attempts[-1]["provider"] = self._summary_provider
-        elif self._summary_model:
-            logger.info(
-                "Compact: body ~%d exceeds summarizer window %d — going straight to the main model",
-                body_tokens_est, summary_window,
-            )
-        if body_tokens_est <= self.context_length * 0.80:
-            attempts.append(dict(call_kwargs))  # main model via main_runtime
-
         summary = None
-        last_err = "no attempt made"
-        for i, attempt_kwargs in enumerate(attempts):
-            label = f"attempt {i + 1}/{len(attempts)}"
-            try:
-                with aux_interrupt_protection():
-                    response = call_llm(**attempt_kwargs)
-                candidate = response.choices[0].message.content
-                if candidate and candidate.strip():
-                    summary = candidate
-                    if i > 0:
-                        logger.info(
-                            "Compact: main-model fallback succeeded after %s failed",
-                            attempts[0].get("model", "main"),
-                        )
-                    break
-                last_err = f"{label}: empty summary"
-            except Exception as e:
-                last_err = f"{label}: {e}"
-            logger.info("Compact: summarizer %s failed (%s)", label, last_err)
+        last_err = "body unreadable in one pass by every candidate window"
+        if not body_unreadable:
+            logger.info(
+                "Compact triggered (%d tokens >= %d threshold): "
+                "summarizing %d turns into ~%d tokens (head=%d, tail=%d)",
+                display_tokens, self.threshold_tokens,
+                len(body), self.target_tokens, len(head), len(tail),
+            )
+
+            conversation_text = _format_conversation_for_summary(body)
+
+            # Build the summarization prompt
+            focus_note = ""
+            if focus_topic:
+                focus_note = (
+                    f"\nADDITIONAL SUMMARIZATION INSTRUCTIONS (user-supplied):\n"
+                    f"Focus topic: \"{focus_topic}\"\n"
+                    f"This compaction should PRIORITISE preserving all information "
+                    f"related to the focus topic above, while still capturing the "
+                    f"other required sections."
+                )
+
+            prompt = ZCODE_SUMMARY_PROMPT.format(
+                target_tokens=self.target_tokens,
+                focus_note=focus_note,
+                conversation_text=conversation_text,
+            )
+
+            summary, last_err = self._attempt_summary_chain(prompt, body_tokens_est)
 
         if summary is not None:
             # Code-enforced redaction (prompt says REDACT, but we enforce it)
@@ -705,15 +689,19 @@ class CompactEngine(ContextEngine):
             self._consecutive_failures = 0
         elif display_tokens >= self.context_length * 0.95:
             # Mechanical rescue at the edge of overflow: the LLM chain is
-            # down but the transcript is ALREADY on disk — compact anyway
-            # with a stub pointing at it. Failing open here means the next
-            # main call 400s and the session dies.
-            self._consecutive_failures += 1
-            logger.warning(
-                "Compact: summarizer chain failed near the context limit (%s) — "
-                "mechanical rescue, full transcript at %s",
-                last_err, transcript_path or "(archive unavailable)",
-            )
+            # down (or the body is unreadable in one pass anywhere) but the
+            # transcript is ALREADY on disk — compact anyway with a stub
+            # pointing at it. Failing open here means the next main call
+            # 400s and the session dies.
+            if not body_unreadable:
+                # An unreadable body is a configuration problem, not an LLM
+                # failure — don't pollute the backoff counter with it.
+                self._consecutive_failures += 1
+                logger.warning(
+                    "Compact: summarizer chain failed near the context limit (%s) — "
+                    "mechanical rescue, full transcript at %s",
+                    last_err, transcript_path or "(archive unavailable)",
+                )
             summary = MECHANICAL_RESCUE_SUMMARY.format(
                 path=transcript_path or
                 "(transcript unavailable — older turns could not be archived)",
@@ -773,8 +761,20 @@ class CompactEngine(ContextEngine):
         # the boundary check here and appended at the end if not already
         # preserved in head/tail. (Previously assigned only after this point,
         # which crashed on empty-tail sessions.)
+        # Membership is POSITIONAL, never dict-equality: `x not in head`
+        # compares contents, so a repeated message (a second "continue")
+        # whose earlier twin lives in the head was silently dropped.
         last_user_msg = self._find_last_user_message(messages)
-        if tail or (last_user_msg is not None and last_user_msg not in head and last_user_msg not in tail):
+        last_user_idx = None
+        for _i in range(len(messages) - 1, -1, -1):
+            if messages[_i].get("role") == "user":
+                last_user_idx = _i
+                break
+        _tail_start = max(head_size, (n_messages - self.preserve_last_n)
+                          if self.preserve_last_n > 0 else n_messages)
+        _lu_in_head = last_user_idx is not None and last_user_idx < head_size
+        _lu_in_tail = last_user_idx is not None and last_user_idx >= _tail_start
+        if tail or (last_user_msg is not None and not _lu_in_head and not _lu_in_tail):
             _next_role = (tail[0].get("role") if tail else None) or (last_user_msg.get("role") if last_user_msg else None)
             if _next_role == summary_role:
                 compressed.append({
@@ -789,10 +789,12 @@ class CompactEngine(ContextEngine):
                     ),
                 })
 
-        # Append the recent tail verbatim (if not already in head)
+        # Append the recent tail verbatim. Head and tail are disjoint slices
+        # (tail_start >= head_size by construction), so no dedup is needed —
+        # and the old content-equality dedup DROPPED legitimate repeated
+        # messages whose twin happened to live in the head.
         for tm in tail:
-            if tm not in head:
-                compressed.append(tm.copy())
+            compressed.append(tm.copy())
 
         # Append the last user message only when it repairs the list or the
         # session genuinely ends on it. After an assistant answer it would
@@ -800,7 +802,7 @@ class CompactEngine(ContextEngine):
         # assistant's reply is valid and lets the model continue instead.
         # (tail ending on a dangling tool MUST still get the append — a bare
         # trailing tool message is a protocol 400.)
-        if last_user_msg is not None and last_user_msg not in head and last_user_msg not in tail:
+        if last_user_msg is not None and not _lu_in_head and not _lu_in_tail:
             tail_end_role = tail[-1].get("role") if tail else None
             session_ends_on_user = bool(messages) and messages[-1] is last_user_msg
             if session_ends_on_user or tail_end_role in (None, "tool"):
@@ -834,6 +836,62 @@ class CompactEngine(ContextEngine):
         except Exception:
             pass
         return compressed
+
+    def _attempt_summary_chain(self, prompt: str, body_tokens_est: int) -> Tuple[Optional[str], str]:
+        """Run the summarizer candidate chain. Returns (summary | None, last_err).
+
+        Dedicated summarizer first (when configured AND its known window can
+        hold the body in one pass), then the MAIN model via main_runtime —
+        a summarizer too small for the body is skipped outright, and a
+        summarizer failure falls back to main instead of failing open.
+        """
+        call_kwargs = {
+            "task": "compression",
+            "main_runtime": {
+                "model": self._model,
+                "provider": self._provider,
+                "base_url": self._base_url,
+                "api_key": self._api_key,
+                "api_mode": self._api_mode,
+            },
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": int(self.target_tokens * 1.5),
+        }
+        summary_window = self._summary_window()
+        attempts = []
+        if self._summary_model and (summary_window <= 0 or body_tokens_est <= summary_window * 0.80):
+            attempts.append(dict(call_kwargs, model=self._summary_model))
+            if self._summary_provider:
+                attempts[-1]["provider"] = self._summary_provider
+        elif self._summary_model:
+            logger.info(
+                "Compact: body ~%d exceeds summarizer window %d — going straight to the main model",
+                body_tokens_est, summary_window,
+            )
+        if body_tokens_est <= self.context_length * 0.80:
+            attempts.append(dict(call_kwargs))  # main model via main_runtime
+
+        summary = None
+        last_err = "no attempt made"
+        for i, attempt_kwargs in enumerate(attempts):
+            label = f"attempt {i + 1}/{len(attempts)}"
+            try:
+                with aux_interrupt_protection():
+                    response = call_llm(**attempt_kwargs)
+                candidate = response.choices[0].message.content
+                if candidate and candidate.strip():
+                    summary = candidate
+                    if i > 0:
+                        logger.info(
+                            "Compact: main-model fallback succeeded after %s failed",
+                            attempts[0].get("model", "main"),
+                        )
+                    break
+                last_err = f"{label}: empty summary"
+            except Exception as e:
+                last_err = f"{label}: {e}"
+            logger.info("Compact: summarizer %s failed (%s)", label, last_err)
+        return summary, last_err
 
     # -- Helpers -------------------------------------------------------------
 

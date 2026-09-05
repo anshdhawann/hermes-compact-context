@@ -26,6 +26,14 @@ is the design, not an accident — preserve it.
    tails, boundaries cutting a tool transaction), not just handcrafted happy
    paths. Consecutive `tool` results are legal; user/user and
    assistant/assistant are not.
+5c. Message membership is POSITIONAL (index), never dict-equality (`in`) —
+   two turns can carry identical content ("continue") and both must survive;
+   equality-based dedup silently dropped the later one (v2.5.1). Every
+   fail-open `return messages` must be weighed against the ≥95%-of-window
+   rescue: skipping is only safe BELOW the urgency line — the v2.5.0 guard
+   bypassed the rescue precisely when it was needed. Rescue tests must make
+   the BODY itself trigger the condition (oversized/unreadable), not just
+   pin a huge `current_tokens` on a tiny conversation.
 6. Behavior change → bump `version:` in `plugin.yaml` in the same commit.
 7. **Never simplify away:** graceful degradation (LLM failure → messages
    unchanged), the secret scrub, strict role alternation, and the failure

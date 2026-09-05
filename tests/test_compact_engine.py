@@ -506,7 +506,9 @@ assert len(_calls24) == 2 and "model" not in _calls24[1], (
 )
 e24c = mod.CompactEngine(context_length=200_000)  # body exceeds BOTH windows
 e24c.transcript_enabled = False
-out24c = e24c.compress(msgs24, current_tokens=250_000)
+# 170K is above the guard but BELOW the 95%-of-window urgency line (190K):
+# skip. (v2.5.1: at >=190K the same input routes into the rescue — see [26].)
+out24c = e24c.compress(msgs24, current_tokens=170_000)
 assert out24c is msgs24 and len(_calls24) == 2, "[24c] body exceeding both windows must be skipped, no calls"
 del _cc["model"], _cc["summary_context_length"]
 _cc["preserve_last_n"] = 6
@@ -535,4 +537,111 @@ finally:
     del _cc["threshold_tokens"]
 print("[25] post-compact floor warning fires when output >= threshold ✓")
 
-print("\nALL 25 CHECKS PASSED ✅")
+# -- v2.5.1: Astra review — guard/rescue, dup messages, tailless sanitize,
+#    PKCS#8 keys, transcript collisions --------------------------------------
+
+# 26. The overflow guard must not bypass the rescue: a body too big for
+# EVERY candidate window at >=95% of the window compacts mechanically —
+# no LLM call is even possible.
+def _forbidden_llm(**kwargs):
+    raise AssertionError("[26] LLM must not be called for an unreadable body")
+mod.call_llm = _forbidden_llm
+e26 = mod.CompactEngine(context_length=200_000)
+e26.on_session_start("t-oversize")
+e26.transcript_enabled = True
+e26.transcript_dir = tempfile.mkdtemp(prefix="compact-oversize-")
+msgs26 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "huge " + "X" * (170_000 * 4)},  # ~170K-token body message
+    {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+    {"role": "user", "content": "u5"}, {"role": "assistant", "content": "a5"},
+]
+out26 = e26.compress(msgs26, current_tokens=195_000)  # 97.5% of the 200K window
+assert out26 is not msgs26, "[26] guard must rescue, not fail open, near overflow"
+stub26 = [m for m in out26 if "Compaction fallback notice" in str(m.get("content", ""))]
+assert stub26 and "compaction_transcript" in stub26[0]["content"], "[26] rescue stub must point at the transcript"
+assert e26._consecutive_failures == 0, "[26] unreadable body is not an LLM failure"
+assert e26.compression_count == 1
+assert not any("XXXX" in str(m.get("content", "")) for m in out26), "[26] oversized body must be dropped"
+for i in range(1, len(out26)):
+    assert out26[i]["role"] != out26[i-1]["role"], (
+        f"[26] alternation broken at {i}: {out26[i-1]['role']}->{out26[i]['role']}"
+    )
+mod.call_llm = fake_call_llm
+print(f"[26] oversized body at 97% of window -> mechanical rescue, roles={[m['role'] for m in out26]} ✓")
+
+# 27. Repeated messages survive: the old content-equality dedup dropped a
+# tail message whose identical twin lived in the head.
+msgs27 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "continue"},       # head twin
+    {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "continue"},       # tail copy — must survive
+    {"role": "assistant", "content": "a3"},
+    {"role": "user", "content": "u4"}, {"role": "assistant", "content": "a4"},
+    {"role": "user", "content": "u5"}, {"role": "assistant", "content": "a5"},
+]
+out27 = _fresh_engine().compress(msgs27, current_tokens=250_000)
+n_continue = sum(1 for m in out27 if m.get("role") == "user" and m.get("content") == "continue")
+assert n_continue == 2, f"[27] repeated 'continue' lost: found {n_continue}"
+for i in range(1, len(out27)):
+    assert out27[i]["role"] != out27[i-1]["role"], (
+        f"[27] alternation broken at {i}: {out27[i-1]['role']}->{out27[i]['role']}"
+    )
+print("[27] repeated 'continue' in head and tail: both survive, alternation intact ✓")
+
+# 28. preserve_last_n=0: sanitization used to be skipped entirely (it ran
+# only under `if tail:`) — a head assistant kept tool_calls whose results
+# were summarized away (unanswered calls = protocol 400).
+msgs28 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "u0"},
+    {"role": "assistant", "tool_calls": [{"id": "cx", "type": "function",
+        "function": {"name": "run", "arguments": "{}"}}], "content": ""},
+    {"role": "tool", "tool_call_id": "cx", "content": "OUT"},
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+]
+out28 = _fresh_engine(protect_first_n=2, preserve_last_n=0).compress(msgs28, current_tokens=250_000)
+assert not any(m.get("tool_calls") for m in out28), "[28] unanswered tool_calls survived a tailless compaction"
+for i in range(1, len(out28)):
+    assert out28[i]["role"] != out28[i-1]["role"], (
+        f"[28] alternation broken at {i}: {out28[i-1]['role']}->{out28[i]['role']}"
+    )
+print(f"[28] preserve_last_n=0 sanitizes the head, roles={[m['role'] for m in out28]} ✓")
+
+# 29. PKCS#8 plain header and truncated-block key material fully redacted.
+blob29a = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqsecretA\n-----END PRIVATE KEY-----"
+blob29b = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADtruncated"  # cut, at end of input
+blob29c = "-----BEGIN RSA PRIVATE KEY-----\nabc123trunc\n-----BEGIN CERTIFICATE-----\nCERTDATA"
+for blob, gone, kept in (
+    (blob29a, "secretA", None),
+    (blob29b, "truncated", None),
+    (blob29c, "abc123trunc", "CERTDATA"),  # redact to next BEGIN, don't over-eat
+):
+    scrubbed29 = mod._scrub_secrets(blob)
+    assert gone not in scrubbed29, f"[29] key material leaked: {gone!r}"
+    if kept:
+        assert kept in scrubbed29, f"[29] over-redaction ate {kept!r}"
+assert "REDACTED" in mod._scrub_secrets(blob29a)
+print("[29] PKCS#8 + truncated private-key blocks fully redacted ✓")
+
+# 30. Transcript writes are exclusive-create unique: two writes inside one
+# second must both survive (they used to overwrite each other).
+e30 = mod.CompactEngine(context_length=1_000_000)
+e30.transcript_enabled = True
+e30.transcript_dir = tempfile.mkdtemp(prefix="compact-collide-")
+p1 = e30._write_transcript(msgs_chain)
+p2 = e30._write_transcript(msgs_chain)
+assert p1 and p2 and p1 != p2, f"[30] filenames collided: {p1} == {p2}"
+assert os.path.exists(p1) and os.path.exists(p2), "[30] one archive was overwritten"
+assert os.path.basename(p1).startswith("compaction_transcript_"), "[30] glob/prune pattern broken"
+print("[30] same-second transcript writes are unique and both survive ✓")
+
+print("\nALL 30 CHECKS PASSED ✅")
