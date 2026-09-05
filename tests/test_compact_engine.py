@@ -692,6 +692,7 @@ def _pin_llm32(**kwargs):
 _cc["model"] = "stub/sum-model"
 e32 = mod.CompactEngine(context_length=1_000_000)
 e32.update_model(model="real-main-model", provider="main-prov", context_length=1_000_000)
+e32.transcript_enabled = False  # AFTER update_model: _load_config resets it from config
 mod.call_llm = _pin_llm32
 out32 = e32.compress(msgs_chain, current_tokens=250_000)
 assert len(_calls32) == 2, f"[32] expected 2 attempts, got {len(_calls32)}"
@@ -822,6 +823,7 @@ _cc["model"] = "stub/sum-model"
 e37 = mod.CompactEngine(context_length=1_000_000)
 e37.update_model(model="real-main", provider="main-prov", base_url="https://main.example",
                  api_key="mk", api_mode="chat_completions", context_length=1_000_000)
+e37.transcript_enabled = False  # AFTER update_model: _load_config resets it from config
 mod.call_llm = _pin_llm37
 e37.compress(msgs_chain, current_tokens=250_000)
 assert len(_calls37) == 2 and _calls37[1].get("api_mode") == "chat_completions", (
@@ -897,8 +899,12 @@ print("[41] prefix variant matches whether a user message follows the summary �
 # the COMPLETE assembled output (wrappers and appended messages included).
 # Window is 20K: the REQUEST (~12K incl. output reserve) passes the 16K
 # guard, but the huge preserved tail busts the 18K budget -> trimmed.
+# Trimming tail content requires a VERIFIED transcript archive (the tail
+# was never summarized — cutting it without recovery destroys it), so this
+# scenario runs with transcripts enabled.
 e42 = mod.CompactEngine(context_length=20_000)  # budget = 18000 after headroom
-e42.transcript_enabled = False
+e42.transcript_enabled = True
+e42.transcript_dir = tempfile.mkdtemp(prefix="compact-test-42-")
 msgs42 = [
     {"role": "system", "content": "S"},
     {"role": "user", "content": "u0"}, {"role": "assistant", "content": "a0"},
@@ -948,4 +954,170 @@ assert any("Formatted guard OK" in str(m.get("content", "")) for m in out43), "[
 mod.call_llm = fake_call_llm
 print(f"[43] guard measures the formatted request ({len(_calls43)} attempt made) ✓")
 
-print("\nALL 43 CHECKS PASSED ✅")
+# -- v2.6.1: Astra round 4 — postcondition + oversized request, archive-
+#    gated trimming, consolidation, quoted secrets, config ranges --------
+
+# 44. An oversized LATEST USER MESSAGE must not re-enter the output verbatim
+# after the trim loop empties the tail: it is truncated to the remaining
+# budget with a pointer to the verified archive (full text recoverable).
+e44 = mod.CompactEngine(context_length=10_000)  # budget = 8976
+e44.target_tokens = 1000  # small output reserve so the guard passes on 10K
+e44.transcript_enabled = True
+e44.transcript_dir = tempfile.mkdtemp(prefix="compact-test-44-")
+msgs44 = [
+    {"role": "system", "content": "S"},
+    {"role": "user", "content": "q0"}, {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "bq1"}, {"role": "assistant", "content": "ba1"},
+    {"role": "user", "content": "bq2"}, {"role": "assistant", "content": "ba2"},
+]
+for i in range(3):
+    msgs44.append({"role": "user", "content": f"tail-q{i} small"})
+    msgs44.append({"role": "assistant", "content": f"tail-a{i} small"})
+GIANT44 = "Please analyse this dataset: " + ("g" * 48_000)  # ~12K tokens
+msgs44.append({"role": "user", "content": GIANT44})
+out44 = e44.compress(msgs44, current_tokens=9_000)  # non-urgent success path
+est44 = mod.estimate_messages_tokens_rough(out44)
+assert est44 <= 8_976, f"[44] oversized latest request re-broke the window: ~{est44} tokens"
+last44 = out44[-1]
+assert last44["role"] == "user", f"[44] expected appended user last, got {last44['role']}"
+assert "truncated by context compaction" in str(last44.get("content", "")), (
+    "[44] truncation note missing from the oversized request"
+)
+_tpath44 = None
+for _f in os.listdir(e44.transcript_dir):
+    _tpath44 = os.path.join(e44.transcript_dir, _f)
+if _tpath44:
+    with open(_tpath44) as _fh:
+        _archived44 = _fh.read()
+    assert "g" * 1000 in _archived44, "[44] full original text not archived for recovery"
+    assert _tpath44 in str(last44.get("content", "")), "[44] truncation note lacks archive pointer"
+for i in range(1, len(out44)):
+    assert out44[i]["role"] != out44[i-1]["role"], (
+        f"[44] alternation broken at {i}: {out44[i-1]['role']}->{out44[i]['role']}"
+    )
+print(f"[44] oversized latest request truncated to fit (~{est44} tokens), archive pointer kept ✓")
+
+# 45. Without a verified transcript archive the trim loop must REFUSE to cut
+# the preserved tail: that content was never sent to the summarizer, so
+# trimming would destroy it outright. Output stays intact (over budget, and
+# loudly reported) instead of silently losing messages.
+_records45 = []
+class _ListHandler45(_logging.Handler):
+    def emit(self, record):
+        _records45.append(record.getMessage())
+_h45 = _ListHandler45()
+mod.logger.addHandler(_h45)
+try:
+    e45 = mod.CompactEngine(context_length=10_000)
+    e45.target_tokens = 1000
+    e45.transcript_enabled = False  # no archive -> no permission to trim
+    msgs45 = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "q0"}, {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "b1"}, {"role": "assistant", "content": "b2"},
+        {"role": "user", "content": "b3"}, {"role": "assistant", "content": "b4"},
+    ]
+    UNIQUE45 = "UNIQUE-TAIL-DETAIL-xyzzy"
+    FILLER45 = "f" * 24_000  # ~6K tokens/message; tail >> budget
+    msgs45.append({"role": "user", "content": UNIQUE45 + FILLER45})  # tail[0]
+    for _ in range(2):
+        msgs45.append({"role": "assistant", "content": FILLER45})
+        msgs45.append({"role": "user", "content": FILLER45})
+    msgs45.append({"role": "assistant", "content": FILLER45})
+    out45 = e45.compress(msgs45, current_tokens=9_000)
+    _all45 = "\n".join(str(m.get("content", "")) for m in out45)
+    assert UNIQUE45 in _all45, "[45] unsummarized tail detail destroyed without an archive"
+    est45 = mod.estimate_messages_tokens_rough(out45)
+    assert est45 > 8_976, "[45] scenario lost its over-budget property"
+    assert any("no verified transcript" in r for r in _records45), (
+        "[45] refusal warning not emitted"
+    )
+    assert any("exceeds the context window" in r for r in _records45), (
+        "[45] final-size postcondition did not report the overflow"
+    )
+finally:
+    mod.logger.removeHandler(_h45)
+print(f"[45] no-archive trim refused, tail intact (~{est45} tokens over budget, reported loudly) ✓")
+
+# 46. Retention consolidation: a pruned INTERMEDIATE archive carries the only
+# verbatim copy of the turns summarized out of it — its records must be
+# consolidated into the chain root before unlinking.
+e46 = mod.CompactEngine(context_length=1_000_000)
+e46.transcript_enabled = True
+e46.transcript_dir = tempfile.mkdtemp(prefix="compact-test-46-")
+e46.transcript_retain = 2
+paths46 = []
+import time as _time46
+for gen in range(1, 5):
+    _p = e46._write_transcript([
+        {"role": "system", "content": f"gen{gen}"},
+        {"role": "user", "content": f"EXCLUSIVE-GEN{gen}-CONTENT"},
+    ])
+    paths46.append(_p)
+    _time46.sleep(0.02)
+e46._prune_old_transcripts(paths46[-1])
+assert not os.path.exists(paths46[1]), "[46] intermediate archive not pruned under retention"
+with open(paths46[0]) as _fh:  # chain root survives and carries gen-2's records
+    _root46 = _fh.read()
+assert "EXCLUSIVE-GEN1-CONTENT" in _root46, "[46] chain root lost its own content"
+assert "EXCLUSIVE-GEN2-CONTENT" in _root46, "[46] pruned generation not consolidated into root"
+assert "_consolidated_from" in _root46, "[46] consolidation marker missing"
+_union46 = _root46
+for _p in (paths46[2], paths46[3]):
+    with open(_p) as _fh:
+        _union46 += _fh.read()
+for gen in range(1, 5):
+    assert f"EXCLUSIVE-GEN{gen}-CONTENT" in _union46, f"[46] gen{gen} verbatim lost from every archive"
+print("[46] pruned intermediates consolidated into the chain root (union covers all generations) ✓")
+
+# 47. Quoted secret values may contain spaces — the quoted pattern must match
+# through the CLOSING quote (the unquoted token pattern stops at whitespace
+# and used to leak every word after the first, or miss short first words).
+_s47a = mod._scrub_secrets('password="correct horse battery staple"')
+assert "horse" not in _s47a and "staple" not in _s47a, f"[47] multi-word quoted password leaked: {_s47a}"
+_s47b = mod._scrub_secrets('password="longfirstword rest of secret"')
+assert "rest of secret" not in _s47b, f"[47] quoted password tail leaked: {_s47b}"
+assert mod._scrub_secrets("password: 'hunter2 secure pass'") == "[REDACTED]", (
+    "[47] single-quoted multi-word value not fully redacted"
+)
+assert "[REDACTED]" in mod._scrub_secrets('{"api_key": "qwertyuiop12345678"}'), (
+    "[47] JSON quoted value regression"
+)
+assert "[REDACTED]" in mod._scrub_secrets("API_KEY=abcdefgh12345678"), (
+    "[47] unquoted assignment regression"
+)
+print("[47] quoted (space-containing) and unquoted secret values fully redacted ✓")
+
+# 48. Config ranges validate (a negative target_tokens used to flow to
+# max_tokens=-150), and the threshold recomputes after a model switch EVEN
+# WHEN the config load itself fails (it used to retain 200K on a 10K window).
+_calls48 = []
+def _tap48(**kwargs):
+    _calls48.append(kwargs)
+    return FakeResponse("## Goal\nRanges OK")
+_cc["target_tokens"] = -100
+mod.call_llm = _tap48
+e48 = mod.CompactEngine(context_length=100_000)
+e48.transcript_enabled = False
+assert e48.target_tokens == 7000, f"[48] negative target_tokens accepted: {e48.target_tokens}"
+e48.compress(msgs_chain, current_tokens=50_000)
+assert _calls48 and _calls48[0]["max_tokens"] == 10_500, (
+    f"[48] max_tokens not derived from validated target: {_calls48[0].get('max_tokens') if _calls48 else 'no call'}"
+)
+del _cc["target_tokens"]
+import hermes_cli.config as _hcfg48
+_orig_load48 = _hcfg48.load_config
+_hcfg48.load_config = lambda: (_ for _ in ()).throw(RuntimeError("config unreadable"))
+try:
+    e48b = mod.CompactEngine(context_length=1_000_000)  # threshold 200_000
+    assert e48b.threshold_tokens == 200_000
+    e48b.update_model("m2", context_length=10_000)
+    assert e48b.threshold_tokens == 2_000, (
+        f"[48] stale threshold after model switch with failed config load: {e48b.threshold_tokens}"
+    )
+finally:
+    _hcfg48.load_config = _orig_load48
+    mod.call_llm = fake_call_llm
+print("[48] config ranges validated; threshold recomputed despite failed config load ✓")
+
+print("\nALL 48 CHECKS PASSED ✅")

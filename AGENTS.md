@@ -50,6 +50,21 @@ is the design, not an accident — preserve it.
    a checked archive fails open). Config reloads reset removed keys and
    validate per-key — one bad value must never abort a load and leave a
    stale threshold behind.
+5f. The size invariant must survive EVERY append: the trim loop only
+   shrinks the tail, but assembly can re-append the oversized LATEST USER
+   MESSAGE after the tail empties — truncate it to the remaining budget
+   (archive-verified only, with a pointer to the full text) and finish with
+   a universal final-size postcondition on every path (v2.6.1). Archive-
+   verified destruction applies to ALL trimming, not just rescues: the
+   preserved tail was never summarized, so cutting it without a verified
+   archive deletes content outright. Retention must preserve the UNION of
+   all archives — every generation holds the only verbatim copy of the
+   turns summarized out of it, so pruned intermediates are consolidated
+   into the chain root, never plain-deleted. Redaction generalizations
+   regress silently: run the SPECIFIC pattern (quoted, spaces allowed)
+   before the general one (unquoted token). Validation must not depend on
+   an unrelated path's success — the threshold recomputes on every model
+   switch even when the config load itself fails.
 6. Behavior change → bump `version:` in `plugin.yaml` in the same commit.
 7. **Never simplify away:** graceful degradation (LLM failure → messages
    unchanged), the secret scrub, strict role alternation, and the failure
@@ -57,4 +72,6 @@ is the design, not an accident — preserve it.
    fail open with backoff). These exist because each one was a live incident
    or a reviewed near-miss; the rescue especially must survive refactors —
    it is the only path that prevents a dead summarizer from killing the
-   session to context overflow.
+   session to context overflow. The transcript-consolidation-on-prune is
+   part of the same contract: it is the only thing keeping session history
+   retrievable across many compactions.
