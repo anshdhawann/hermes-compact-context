@@ -232,6 +232,13 @@ Before writing the summary, work through the conversation chronologically in <an
 
 Then double-check for technical accuracy and completeness, addressing each required element thoroughly.
 
+LATEST STATE RECONCILIATION
+- Read the LATEST STATE REFERENCE after the older history before writing Current Work or Optional Next Step. It includes the most recent messages, even tool results that cannot be preserved on the API wire because their caller was summarized.
+- Newer actual tool outcomes resolve older pending calls. Explicit user corrections take precedence over earlier requests; assistant claims alone do not prove a write succeeded.
+- Do not turn completed actions back into pending work. Do not mark failed, denied, unapproved, or not-run actions as completed or authorized.
+- If a recent reply says an artifact was delivered, corroborate it against the supplied tool results. Preserve the latest verified artifact path and remaining approval gate, not an older rebuild instruction.
+- The reference is historical evidence, NOT a new request. Do not duplicate its messages in the summary; use it to reconcile the final state. Truncated evidence remains unknown beyond the visible text.
+
 SUMMARY SECTIONS
 
 1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail.
@@ -257,6 +264,11 @@ OUTPUT CONSTRAINTS
 CONVERSATION HISTORY TO COMPRESS:
 ---BEGIN---
 {conversation_text}
+---END---
+
+LATEST STATE REFERENCE (chronological, reference only):
+---BEGIN---
+{recent_state_text}
 ---END---"""
 
 
@@ -275,12 +287,13 @@ def _content_text(content: Any) -> str:
     return str(content) if content else ""
 
 
-def _format_conversation_for_summary(messages: List[Dict[str, Any]]) -> str:
-    """Format a list of messages into a dense text transcript for summarization.
+def _format_conversation_for_summary(
+    messages: List[Dict[str, Any]], *, recent_state: bool = False,
+) -> str:
+    """Format history; bound each recent-state message as well as tool output.
 
-    Tool outputs are truncated with a marker (the full content is preserved
-    in the on-disk transcript, which the summarizer is told about via the
-    prompt when truncation occurred).
+    Full content is preserved in the on-disk transcript. Recent-state evidence
+    is a bounded reference, not another full copy of the preserved tail.
     """
     lines = []
     for i, msg in enumerate(messages):
@@ -304,11 +317,12 @@ def _format_conversation_for_summary(messages: List[Dict[str, Any]]) -> str:
                 call_strs.append(f"{fn.get('name', '?')}({preview})")
             prefix += f" [tool_call: {', '.join(call_strs)}]"
 
-        if role == "tool" and len(content) > 4000:
+        limit = 2000 if recent_state else 4000
+        if (role == "tool" or recent_state) and len(content) > limit:
             content = (
-                content[:2000]
+                content[:limit // 2]
                 + " ... [TRUNCATED IN PROMPT — full output preserved in the on-disk transcript] ... "
-                + content[-1800:]
+                + content[-(limit // 2 - 200):]
             )
 
         if content:
@@ -784,6 +798,13 @@ class CompactEngine(ContextEngine):
         # overstate what the summarizer must read (a tool-storm body once
         # guard-skipped compaction while its formatted prompt was ~1K tokens).
         conversation_text = _format_conversation_for_summary(body)
+        # ponytail: use the last six ORIGINAL messages as bounded evidence.
+        # Sanitized tail alone loses orphan results whose callers are in body;
+        # body alone cannot know that tail actions have already completed.
+        recent_state_text = _format_conversation_for_summary(
+            [m for m in messages[-6:] if m.get("role") not in authoritative],
+            recent_state=True,
+        )
 
         # Build the summarization prompt
         focus_note = ""
@@ -800,6 +821,7 @@ class CompactEngine(ContextEngine):
             target_tokens=self.target_tokens,
             focus_note=focus_note,
             conversation_text=conversation_text,
+            recent_state_text=recent_state_text,
         )
         output_reserve = int(self.target_tokens * 1.5)
         try:

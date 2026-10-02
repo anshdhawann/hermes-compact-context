@@ -1340,3 +1340,53 @@ for _number, _check in enumerate((
         _review_failures.append(f"[{_number}] {_check.__name__}: {exc}")
 assert not _review_failures, "\n".join(_review_failures)
 print("\nALL 52 CHECKS PASSED")
+
+# 53. The summary must see the latest state, INCLUDING tool results removed
+# from the preserved tail as orphans. Otherwise the body ends on pending
+# calls and the summary resurrects work that the final reply says is done.
+def _review_recent_state():
+    with _review_case() as (engine, directory):
+        rows = _review_history()[:-1]
+        rows += [{"role": "assistant", "content": "Apply skill/index/AGENTS patches.",
+                  "tool_calls": [
+                      {"id": name, "type": "function", "function": {
+                          "name": "patch", "arguments": json.dumps({"path": name})}}
+                      for name in ("skill", "agents", "index")]}]
+        rows += [
+            {"role": "tool", "tool_call_id": "skill", "content": "SKILL_PATCH_CONFIRMED"},
+            {"role": "tool", "tool_call_id": "agents", "content": "AGENTS_APPROVAL_BLOCKED: no consent, do not retry"},
+            {"role": "tool", "tool_call_id": "index", "content": "INDEX_PATCH_CONFIRMED"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "zip", "type": "function", "function": {
+                    "name": "execute_code", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "zip", "content": "ZIP_INTEGRITY_PASS"},
+            {"role": "assistant", "content": "ARTIFACT_READY. Runtime tests NOT_RUN. Await staging approval."},
+        ]
+        original = copy.deepcopy(rows)
+        out = engine.compress(rows, current_tokens=5000)
+        prompt = captured_prompt["kwargs"]["messages"][0]["content"]
+        for marker in ("SKILL_PATCH_CONFIRMED", "AGENTS_APPROVAL_BLOCKED",
+                       "INDEX_PATCH_CONFIRMED", "ZIP_INTEGRITY_PASS", "ARTIFACT_READY"):
+            assert marker in prompt, f"latest outcome hidden from summarizer: {marker}"
+        assert "LATEST STATE REFERENCE" in prompt
+        assert "Do not turn completed actions back into pending work" in prompt
+        assert rows == original, "summary reference mutated live history"
+        _assert_review_protocol(out)
+        assert out[-3:] == rows[-3:], "reference changed the preserved final transaction"
+        assert not any(r.get("content") == "AGENTS_APPROVAL_BLOCKED: no consent, do not retry"
+                       for r in out), "orphan result leaked onto the API wire"
+        assert "AGENTS_APPROVAL_BLOCKED" in next(directory.glob("*.jsonl")).read_text()
+    # Reference formatting must stay bounded and explicitly mark truncation,
+    # including huge assistant/user messages, not just tool outputs.
+    with _review_case() as (engine, _):
+        rows = _review_history()
+        rows[-1]["content"] = "LATEST_STATUS_START " + "X" * 100000 + " LATEST_STATUS_END"
+        engine.compress(rows, current_tokens=5000)
+        prompt = captured_prompt["kwargs"]["messages"][0]["content"]
+        assert "LATEST_STATUS_START" in prompt and "LATEST_STATUS_END" in prompt
+        assert "TRUNCATED IN PROMPT" in prompt
+        assert len(prompt) < 20000, "recent-state reference can overflow the summarizer"
+
+_review_recent_state()
+print("[53] recent state and orphaned tail outcomes reach the summarizer; reference bounded")
+print("\nALL 53 CHECKS PASSED")

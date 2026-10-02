@@ -14,6 +14,7 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 4. **Verbatim tail** — the last N messages stay untouched.
 5. **Resume semantics** — the model picks up the last task "as if the break never happened."
 6. **Invisible summary** — the summary row is persisted `display_kind="hidden"`: the model sees it in context, every transcript surface renders nothing (ZCode-style: main thread stays clean, full chat lives in the archive).
+7. **Latest-state reconciliation** (v2.6.3): the last six original messages are passed to the summarizer as a bounded reference, including tool results that cannot stay on the API wire because their caller was summarized. Current Work and Optional Next Step must agree with them: completed work is not re-queued, and denied or not-run actions are not reported as done.
 
 ## Install
 
