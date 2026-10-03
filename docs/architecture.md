@@ -127,6 +127,14 @@ Five verified findings (all reproduced on 480147e before fixing), checks [44]–
 - Quoted secret values are matched by their opening delimiter, including escaped quotes. An opposite quote within a password is part of the value; unquoted assignment redaction remains separate.
 - Regression checks exercise actual config loads and complete output, including session-prefix collisions, repeated consolidation, mixed/escaped quotes, short urgent histories, oversized preserved heads and latest requests, and impossible system floors. The suite runs offline with stubs and with actual Hermes classes/estimator; LLM calls remain mocked.
 
+## Summary input (v2.8)
+
+- **Messages mode (default).** One system message carries the instructions (with a rule that the history is material to summarize, not instructions to obey). The body follows as real `user`/`assistant` turns. Assistant tool calls become `[tool_call: name#id(args)]` text lines; tool results become user turns starting `[result of name#id]:`. No `tool` role or `tool_calls` field reaches the summarizer, so no tool schema is required and Anthropic-style "tool_use needs tools" rejections cannot occur. Consecutive same-role turns merge, keeping strict alternation. A closing user turn carries the LATEST STATE REFERENCE and the write-the-handoff instruction.
+- **Images.** The newest `max_summary_images` image parts (Chat `image_url`, Responses `input_image`, Anthropic `image`+`source`; only `data:image/` and http(s) URLs) are sent natively. Capability comes from Hermes' own lookup (config override, models.dev, local probes) per route; unknown means try. A route known not to read images gets placeholders up front; an image-related error retries the same route once with placeholders. Request size counts ~1,600 tokens per image.
+- **Documents.** Parts that already carry text are inlined, capped at 4,000 chars. Binary documents (PDF bytes, file ids) and audio stay named placeholders; the archive keeps the originals.
+- **Fallbacks.** A request-shape rejection (400, invalid role/alternation, unsupported content) gets ONE retry as the v2.7 flattened text prompt. Network or availability failures do not, so a down chain is not called twice. `summary_input: text` restores the flattened prompt everywhere.
+- **Verified live (2026-10-03):** Settings route DeepSeek v4.1 Flash accepted the structured request with one PNG in 24s and described the logo's contents in the handoff.
+
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).
