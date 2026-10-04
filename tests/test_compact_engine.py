@@ -139,7 +139,7 @@ assert summary_msg.get("display_kind") == "hidden", (
     "summary must persist display_kind='hidden' (invisible in transcript, "
     "present in model context)"
 )
-assert "Pick up the last task as if the break never happened" in stext, "resume note missing"
+assert "Go straight back into the last task where it stopped" in stext, "resume note missing"
 assert "Recent messages are preserved verbatim" in stext, "recent-preserved note missing"
 print("[2] summary contains transcript path + resume + preserved-tail notes ✓")
 
@@ -165,7 +165,7 @@ print("[5] final user message present ✓")
 prompt = _req_text(captured_prompt["kwargs"])
 for sec in ["Primary Request and Intent", "Files and Code Sections", "Errors and Fixes",
             "Security and Constraints", "All user messages", "Current Work", "Optional Next Step",
-            "Respond with TEXT ONLY", "grantit pipeline",
+            "Respond in plain text only", "grantit pipeline",
             "TRUNCATED IN PROMPT"]:
     assert sec in prompt, f"prompt missing: {sec}"
 print("[6] ZCode 10-section prompt + focus topic + truncation marker ✓")
@@ -1622,7 +1622,9 @@ def _check_too_long_reselection():
         if expect_calls == 2:
             assert "OLDEST messages were omitted" in _req_text(calls[1])
             assert "RESELECTED" in _summary_of(out)
-            assert "question-3" not in _req_text(calls[1]).split("LATEST STATE REFERENCE")[0]
+            hist = _req_text(calls[1]).rsplit("LATEST STATE REFERENCE", 1)[0]
+            # Body is answer-1..answer-6; an unsized error drops the oldest third.
+            assert "question-2" not in hist and "question-5" in hist, "oldest third not dropped"
 
 # 60. Rapid-refill breaker: three back-to-back automatic re-fires pause
 # automatic compaction; urgency and a later re-probe still work.
@@ -1728,7 +1730,7 @@ def _check_structured_shape():
     with _review_case() as (engine, _):
         engine.compress(_tool_round_rows(), current_tokens=5000)
         msgs = captured_prompt["kwargs"]["messages"]
-    assert msgs[0]["role"] == "system" and "Respond with TEXT ONLY" in msgs[0]["content"], "no system instructions"
+    assert msgs[0]["role"] == "system" and "Respond in plain text only" in msgs[0]["content"], "no system instructions"
     assert "HISTORY to summarize" in msgs[0]["content"], "history-not-instructions rule missing"
     roles = [m["role"] for m in msgs[1:]]
     assert roles[0] == "user" and roles[-1] == "user", roles
@@ -1832,3 +1834,154 @@ for _number, _check in enumerate((
         mod.call_llm = fake_call_llm
 assert not _v28_failures, "\n".join(_v28_failures)
 print("\nALL 66 CHECKS PASSED")
+
+# -- v2.9: size-aware too-long retries + post-compaction file re-attachment --
+
+# 67. A reported overflow ("N tokens > M") drops only enough oldest history
+# to cover it (+10%); an unsized error still drops a third.
+def _check_sized_reselection():
+    assert mod._prompt_too_long_gap("prompt is too long: 12,500 tokens > 10,000 maximum") == 2500
+    assert mod._prompt_too_long_gap(
+        "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens") == 808
+    assert mod._prompt_too_long_gap("This model's maximum context length is 8192 tokens") is None
+    rows = [{"role": "system", "content": "sys"}]
+    for i in range(30):
+        rows += [{"role": "user", "content": f"Q{i:02d} " + "x" * 150},
+                 {"role": "assistant", "content": f"A{i:02d} " + "y" * 150}]
+    def body_kept(err):
+        calls = []
+        def flaky(**kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise RuntimeError(err)
+            return FakeResponse("## Current Work\nSIZED")
+        with _review_case() as (engine, _):
+            mod.call_llm = flaky
+            out = engine.compress(rows, current_tokens=5000)
+        assert len(calls) == 2 and "SIZED" in _summary_of(out), err
+        hist = _req_text(calls[1]).rsplit("LATEST STATE REFERENCE", 1)[0]
+        return sum(1 for i in range(30) if f"Q{i:02d} " in hist)
+    sized = body_kept("prompt is too long: 10010 tokens > 10000 maximum")
+    unsized = body_kept("prompt is too long for this model")
+    assert sized > unsized, f"sized retry dropped as much as the blind third: {sized} vs {unsized}"
+    assert sized < 24, f"sized retry dropped nothing useful: kept {sized}"
+
+def _reattach_rows(tmp):
+    files = {}
+    for name, body in (("a.py", "A_CONTENT"), ("b.py", "B_CONTENT"), ("c.py", "C_CONTENT"),
+                       (".env", "API_KEY=sk-should-never-appear"), ("big.txt", "Z" * 40_000)):
+        path = Path(tmp) / name
+        path.write_text(body)
+        files[name] = str(path)
+    (Path(tmp) / "bin.dat").write_bytes(b"\x00\x01binary")
+    files["bin.dat"] = str(Path(tmp) / "bin.dat")
+    rows = _review_history()
+    calls = []
+    for n, key in enumerate(("a.py", ".env", "big.txt", "bin.dat", "b.py")):
+        calls += [{"role": "assistant", "content": "", "tool_calls": [{"id": f"r{n}", "type": "function",
+                   "function": {"name": "read_file", "arguments": json.dumps({"path": files[key]})}}]},
+                  {"role": "tool", "tool_call_id": f"r{n}", "content": f"old read of {key}"}]
+    rows[4:4] = calls
+    rows[-2:-2] = [{"role": "assistant", "content": "", "tool_calls": [{"id": "rt", "type": "function",
+                    "function": {"name": "read_file", "arguments": json.dumps({"path": files["c.py"]})}}]},
+                   {"role": "tool", "tool_call_id": "rt", "content": "C_CONTENT"}]
+    return rows
+
+# 68. Re-attachment: newest body reads come back with CURRENT disk contents;
+# secrets, binaries and tail reads are skipped; oversized files get a pointer.
+def _check_reattach():
+    with tempfile.TemporaryDirectory(prefix="reattach-") as tmp:
+        rows = _reattach_rows(tmp)
+        (Path(tmp) / "b.py").write_text("B_CONTENT_EDITED_AFTER_READ")
+        with _review_case(preserve_last_n=4) as (engine, _):
+            engine.context_length = 200_000
+            engine.threshold_tokens = 100_000
+            summary = _summary_of(engine.compress(rows, current_tokens=5000))
+            attached = list(engine.last_reattached)
+    assert "Recently read files" in summary, "no re-attachment block"
+    assert "B_CONTENT_EDITED_AFTER_READ" in summary and "A_CONTENT" in summary, "body reads not re-attached"
+    assert summary.index("B_CONTENT_EDITED") < summary.index("A_CONTENT"), "not newest first"
+    assert "sk-should-never-appear" not in summary and ".env" not in summary, "secret file re-attached"
+    assert "bin.dat" not in summary, "binary re-attached"
+    assert "big.txt" in summary and "too large to include" in summary and "Z" * 1000 not in summary
+    assert "C_CONTENT" not in summary.split("Recently read files")[1], "tail read duplicated"
+    assert len(attached) == 3, attached
+
+# 69. Limits: reattach_files caps the count; 0 disables; an over-budget
+# block is dropped before any preserved tail message is trimmed.
+def _check_reattach_limits():
+    with tempfile.TemporaryDirectory(prefix="reattach-") as tmp:
+        rows = _reattach_rows(tmp)
+        with _review_case(preserve_last_n=4, reattach_files=1) as (engine, _):
+            engine.context_length = 200_000; engine.threshold_tokens = 100_000
+            summary = _summary_of(engine.compress(rows, current_tokens=5000))
+        assert "B_CONTENT" in summary and "A_CONTENT" not in summary, "reattach_files=1 ignored"
+        with _review_case(preserve_last_n=4, reattach_files=0) as (engine, _):
+            summary = _summary_of(engine.compress(rows, current_tokens=5000))
+        assert "Recently read files" not in summary, "reattach_files=0 ignored"
+        (Path(tmp) / "a.py").write_text("Q" * 18_000)
+        with _review_case(preserve_last_n=4) as (engine, _):
+            engine.context_length = 6_000; engine.threshold_tokens = 4_000_000
+            out = engine.compress(rows, current_tokens=5000)
+        summary = _summary_of(out)
+        assert "Q" * 1000 not in summary, "over-budget re-attachment kept"
+        assert any("C_CONTENT" in str(m.get("content")) for m in out), "tail trimmed instead of dropping files"
+
+# 70. Review hardening: credential files (netrc, pgpass, docker, service
+# accounts) are skipped; credential lines are scrubbed; oversized files are
+# never opened (decided from stat); fences outgrow backtick runs in content;
+# a non-dict tool_call "function" cannot raise out of compress().
+def _check_reattach_hardening():
+    import builtins
+    with tempfile.TemporaryDirectory(prefix="reattach-") as tmp:
+        t = Path(tmp)
+        (t / ".docker").mkdir()
+        bodies = {".netrc": "machine x login u password NETRC_PW",
+                  ".pgpass": "h:5432:db:u:PGPASS_PW",
+                  ".docker/config.json": '{"auths":{"x":{"auth":"DOCKER_AUTH"}}}',
+                  "my-service_account.json": '{"private_key":"SA_KEY"}',
+                  "notes.txt": "login u\npassword NOTES_PW\nkeep ```` fence",
+                  "huge.log": "H" * 100_000}
+        for name, text in bodies.items():
+            (t / name).write_text(text)
+        os.symlink(t / ".netrc", t / "innocent.md")
+        order = [".netrc", ".pgpass", ".docker/config.json", "my-service_account.json",
+                 "innocent.md", "huge.log", "notes.txt"]
+        body = []
+        for n, name in enumerate(order):
+            body += [{"role": "assistant", "content": "", "tool_calls": [{"id": f"h{n}", "type": "function",
+                      "function": {"name": "read_file", "arguments": json.dumps({"path": str(t / name)})}}]},
+                     {"role": "tool", "tool_call_id": f"h{n}", "content": "x"}]
+        body.append({"role": "assistant", "content": "", "tool_calls": [{"id": "bad", "function": "read_file"}]})
+        opened = []
+        real_open = builtins.open
+        def spy_open(path, *a, **k):
+            opened.append(str(path))
+            return real_open(path, *a, **k)
+        with _review_case(preserve_last_n=4, reattach_files=10) as (engine, _):
+            engine.threshold_tokens = 1_000_000
+            builtins.open = spy_open
+            try:
+                block = engine._reattach_block(body, [])
+            finally:
+                builtins.open = real_open
+    for secret in ("NETRC_PW", "PGPASS_PW", "DOCKER_AUTH", "SA_KEY", "NOTES_PW"):
+        assert secret not in block, f"{secret} re-attached"
+    assert "notes.txt" in block and "[REDACTED]" in block, "scrubbed file missing"
+    assert "huge.log" in block and "too large to include" in block, "oversized pointer missing"
+    assert not any(o.endswith("huge.log") for o in opened), "oversized file was opened"
+    assert "`````\n" in block, "fence not longer than the content's backtick run"
+
+_v29_failures = []
+for _number, _check in enumerate((_check_sized_reselection, _check_reattach, _check_reattach_limits,
+                                      _check_reattach_hardening), 67):
+    try:
+        _check()
+        print(f"[{_number}] {_check.__name__} passed")
+    except AssertionError as exc:
+        import traceback
+        _v29_failures.append(f"[{_number}] {_check.__name__}: {exc}\n{traceback.format_exc(limit=2)}")
+    finally:
+        mod.call_llm = fake_call_llm
+assert not _v29_failures, "\n".join(_v29_failures)
+print("\nALL 70 CHECKS PASSED")

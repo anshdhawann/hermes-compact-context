@@ -12,11 +12,13 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 2. **11-section handoff summary** — chronological analysis over every message: requests & intent, technical concepts, files & full code snippets, errors & fixes, user preferences, all user messages (verbatim), security constraints (preserved VERBATIM), key decisions, pending tasks, current work, optional next step.
 3. **Transcript archive + pointer** — the full pre-compaction conversation is written to JSONL on disk and the path is injected into the summary, so the model can re-read exact details on demand. *Context shrinks; information does not disappear.*
 4. **Verbatim tail** — the last N messages stay untouched.
-5. **Resume semantics** — the model picks up the last task "as if the break never happened."
+5. **Resume semantics** — the model goes straight back into the last task, with no recap and no mention of the summary.
 6. **Invisible summary** — the summary row is persisted `display_kind="hidden"`: the model sees it in context, every transcript surface renders nothing (ZCode-style: main thread stays clean, full chat lives in the archive).
 7. **Latest-state reconciliation** (v2.6.3): the last six original messages are passed to the summarizer as a bounded reference, including tool results that cannot stay on the API wire because their caller was summarized. Current Work and Optional Next Step must agree with them: completed work is not re-queued, and denied or not-run actions are not reported as done.
 8. **Settings-routed summarizer** (v2.7): `compact-context.model` override, then Settings > Auxiliary > Compression, then the session model. Thinking effort comes from config. Adaptive size (floor `target_tokens`, 10% of the body, capped at `max_target_tokens` and 10% of the window), whole tool rounds in the tail, microcompaction of old bulky tool output when that alone is enough, a rapid-refill breaker, and drop-oldest retries when a request is too long.
 9. **Real conversation input + images** (v2.8): the summarizer receives the history as real user/assistant turns (tool calls as text lines, tool results as labelled user turns, so no tool schema is needed on any provider) instead of one flattened transcript. The newest `max_summary_images` images travel as real image parts to any route Hermes knows (or assumes) can read images; other routes, older images, binary documents and audio get named placeholders. Documents that already carry text are inlined (capped). An image rejection retries the same route with placeholders; a request-shape rejection retries once as flattened text.
+10. **File re-attachment** (v2.9): after compaction, the newest files read in the summarized history (up to `reattach_files`, default 5) are re-read from disk and appended to the summary, so the model sees their current contents without re-reading. Per-file cap `reattach_file_tokens` (5K) and total cap `reattach_total_tokens` (50K, never more than 15% of the trigger); larger files get a "use read_file" note. Files already read in the kept tail, secret-looking paths (`.env`, keys, `.ssh/`, `auth.json`, credentials) and binaries are skipped. The block is dropped before any preserved tail message would be trimmed.
+11. **Size-aware too-long retries** (v2.9): when the summarizer reports how far over the limit the request was ("N tokens > M", or "maximum context length is M ... requested N"), only enough of the oldest history to cover that gap plus 10% is moved to archive-only, instead of a fixed third. Up to 3 retries.
 
 ## Install
 
@@ -57,6 +59,9 @@ compact-context:
   reasoning_effort: ""      # summarizer thinking effort; empty = Settings, then agent.reasoning_effort (v2.7)
   summary_input: messages   # messages = real role-structured turns (default); text = one flattened prompt (v2.8)
   max_summary_images: 4     # newest N images sent natively to vision-capable routes; 0 = placeholders only (v2.8)
+  reattach_files: 5         # newest N files read before compaction re-attached with current contents; 0 = off (v2.9)
+  reattach_file_tokens: 5000   # per-file cap; larger files get a re-read note (v2.9)
+  reattach_total_tokens: 50000 # total cap, also limited to 15% of the trigger (v2.9)
 compression:
   in_place: true            # REQUIRED — see Install
 ```
@@ -83,11 +88,11 @@ Trigger tuning: `threshold_tokens` alone = fixed mode (fires at exactly N tokens
 | Claude Code auto-compact | paging + selective clearing + summarize | ❌ |
 | Codex CLI /compact | checkpoint handoff summary | ❌ |
 | OpenCode | overflow summarization + tool-output pruning | ❌ |
-| ZCode /compact | full rewrite + transcript archive | ✅ (closed-source) |
+| ZCode /compact | full rewrite with the session model, file re-attach | ❌ archived, but the path is not passed in the active compaction path (v3.14.3 source) |
 
 ## Attribution
 
-Inspired by the compaction design of [ZCode](https://zcode.z.ai) (Z.AI) — the best long-session compaction I've used; sessions effectively last forever. This project is an independent, original implementation. It is **not affiliated with, endorsed by, or sponsored by Z.AI / ZCode.**
+Inspired by the compaction design of [ZCode](https://zcode.z.ai) (Z.AI) — the best long-session compaction I've used; sessions effectively last forever. This project is an independent, original implementation. It is **not affiliated with, endorsed by, or sponsored by Z.AI / ZCode.** ZCode was open-sourced under Apache-2.0 on 2026-09-20 ([zai-org/ZCode](https://github.com/zai-org/ZCode)); v2.9 behavior was checked against its v3.14.3 compaction source. No ZCode code is copied. The summary prompt and resume notes were rewritten in v2.9 in fresh wording; an 8-word phrase comparison against ZCode's compaction source finds no shared passages. The 11 section names are kept as plain labels.
 
 See [docs/architecture.md](docs/architecture.md) for the design details and provenance.
 

@@ -1,5 +1,5 @@
 name: compact-context
-version: 2.8.0
+version: 2.9.0
 description: >
   ZCode-style context compression engine for Hermes Agent. Preserves the system
   prompt and head, keeps whole recent tool rounds verbatim, clears old bulky
@@ -7,7 +7,8 @@ description: >
   the rest into one adaptive 7K-20K structured summary routed through
   Settings > Auxiliary > Compression (falling back to the session model), and
   archives the full transcript to disk with a pointer injected into the summary.
-  The summarizer reads real user/assistant turns and the newest images natively.
+  The summarizer reads real user/assistant turns and the newest images natively;
+  recently read files are re-attached with current contents after compaction.
 homepage: https://github.com/anshdhawann/hermes-compact-context
 author: Ansh Dhawan
 kind: standalone

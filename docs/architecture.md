@@ -4,7 +4,7 @@ How `hermes-compact-context` works, and where the design comes from.
 
 ## Design origin
 
-The design is inspired by the compaction behavior of [ZCode](https://zcode.z.ai) (Z.AI), observed in its shipped application (v3.7.x, Aug 2026). ZCode's `/compact` "never forgets": the full conversation is archived to disk, a pointer to the transcript is injected into the compacted context, an exhaustive handoff summary is generated, and recent messages stay verbatim. This engine is an independent, original implementation of that design for Hermes Agent's context-engine plugin interface. No ZCode code is included; the summary prompt is original wording with the same section structure.
+The design is inspired by the compaction behavior of [ZCode](https://zcode.z.ai) (Z.AI), observed in its shipped application (v3.7.x, Aug 2026). ZCode's `/compact` "never forgets": the full conversation is archived to disk, a pointer to the transcript is injected into the compacted context, an exhaustive handoff summary is generated, and recent messages stay verbatim. This engine is an independent, original implementation of that design for Hermes Agent's context-engine plugin interface. No ZCode code is included; the summary prompt keeps the same 11 section labels, and its wording was rewritten in v2.9 (an 8-word phrase comparison against ZCode v3.14.3's compaction source finds no shared passages).
 
 ## Lifecycle
 
@@ -135,10 +135,15 @@ Five verified findings (all reproduced on 480147e before fixing), checks [44]–
 - **Fallbacks.** A request-shape rejection (400, invalid role/alternation, unsupported content) gets ONE retry as the v2.7 flattened text prompt. Network or availability failures do not, so a down chain is not called twice. `summary_input: text` restores the flattened prompt everywhere.
 - **Verified live (2026-10-03):** Settings route DeepSeek v4.1 Flash accepted the structured request with one PNG in 24s and described the logo's contents in the handoff.
 
+## File re-attachment and sized retries (v2.9)
+
+- **Re-attachment.** ZCode keeps a read-file state and re-injects up to 5 recently read files (5K tokens each, 50K total) after compaction. Hermes plugins have no read-file state, so the engine derives it from the summarized body: `read_file`-style tool calls (`path`/`file_path` arguments), newest first, deduplicated, excluding files read in the kept tail. Files are re-read from disk at compaction time (current contents), secrets are scrubbed, secret-looking paths and binaries are skipped. The block is appended to the summary message (no extra role turns). Total is capped at min(`reattach_total_tokens`, 15% of the trigger). If the assembled output exceeds the budget, the block is dropped before the tail-trimming loop runs. Never added on the emergency rescue path.
+- **Sized retries.** The overflow gap is parsed from the provider error. The oldest body messages are dropped until their rough size (content plus tool-call args, tool output capped at the 4K the request carries) covers gap x 1.1 + 500 tokens; with no parsable gap, the oldest third is dropped as before. Three retries (ZCode: 3). ZCode first moves recent rounds into the kept tail before dropping old ones; Hermes keeps a larger tail already, so it only drops oldest (archive-only).
+
 ## Provenance notes
 
 - ZCode behavior observed in its shipped application (v3.7.6, Aug 2026) and its on-disk state (`~/.zcode/cli/agents/<session>/<agent>/transcript.jsonl`, `~/.zcode/cli/memories/projects/<project>/`).
 - VERIFIED against live ZCode artifacts (2026-08-26: a 2026-07-03 compaction summary recovered from ZCode's own session database, plus a live continued session): full-rewrite summary, numbered-section format, delivery as a **user-role message**, preserved recent tail, and an append-only store that never deletes old turns — all confirmed.
 - Two deliberate Hermes-specific divergences: **(1)** ZCode does NOT inject a transcript pointer into the summary — the pointer here is our extension, the Hermes-native way to give the model re-read access (ZCode's own store serves that role internally). **(2)** ZCode never prunes its store; our `transcript_retain: 2` pruning is safe because Hermes' `in_place` soft-archive already retains every pre-compaction turn in the session database.
 - ZCode's section list (Problem Solving / All user messages / Pending Tasks) differs from ours in 3 of 9 slots; v2.2 adopts ZCode's "All user messages" verbatim-voice section.
-- ZCode is closed-source and evolving; its compaction may change between versions. This engine replicates the design as of the version noted above.
+- ZCode was closed-source when this engine was designed (observed behavior, v3.7.x). It was open-sourced under Apache-2.0 on 2026-09-20; v2.9 was checked against the v3.14.3 source (`apps/zcode-cli/packages/core/src/compact/` and `runtime/methods/compact-active.ts`). No ZCode code is copied.

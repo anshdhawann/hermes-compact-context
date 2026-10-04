@@ -75,3 +75,9 @@ is the design, not an accident — preserve it.
    session to context overflow. The transcript-consolidation-on-prune is
    part of the same contract: it is the only thing keeping session history
    retrievable across many compactions.
+
+## Recent decisions
+
+- (2026-10-03) **v2.8.0** shipped (`e08c0e2`): role-structured summary input and native images. Own commit on `~/code/hermes-compact-context`.
+- (2026-10-04) **v2.9.0**: post-compaction file re-attachment and size-aware too-long retries, checked against the open-sourced ZCode v3.14.3 compaction source.
+- v2.9.0 (2026-10-04): summary prompt, archive pointer and resume note rewritten in fresh wording after an 8-gram check found 26% of the old prompt shared phrasing with ZCode's Apache-2.0 prompt; license stays MIT. Re-attach hardened after review (stat before read, bounded read, credential-file skip + scrub, dynamic fence, non-dict tool_call guard); 70 checks.
