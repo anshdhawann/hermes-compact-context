@@ -6,6 +6,19 @@ ZCode-style aggressive context compression for [Hermes Agent](https://hermes-age
 
 The built-in Hermes compressor protects the last ~20 messages verbatim and only summarizes the middle — on a 284K-token session it goes 284K → ~280K. This engine goes **284K → 7K-20K** (the summary scales with the history) while keeping everything retrievable.
 
+## Real sessions
+
+Every automatic compaction logged on my machine over Oct 4-5, 2026: 22 runs. 21 fired at about 300K tokens (`threshold_tokens: 300000`), one at 217K on a smaller-window model.
+
+| | Min | Median | Max |
+| --- | --- | --- | --- |
+| Messages before | 120 | 230 | 304 |
+| Messages after | 10 | 11 | 14 |
+| Reduction | 91.5% | 95.2% | 96.4% |
+| Time to compact | 63 s | 111 s | 203 s |
+
+Summarizer: DeepSeek V4.1 Flash, medium thinking effort. Every run archived the full transcript first. Two forced runs on shorter sessions (below the trigger) are excluded.
+
 ## How it works
 
 1. **Full rewrite** — the whole conversation is summarized in one pass by the summarizer route (see 8). No protected middle, no iterative re-compression.
