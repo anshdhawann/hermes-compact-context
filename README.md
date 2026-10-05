@@ -19,6 +19,7 @@ The built-in Hermes compressor protects the last ~20 messages verbatim and only 
 9. **Real conversation input + images** (v2.8): the summarizer receives the history as real user/assistant turns (tool calls as text lines, tool results as labelled user turns, so no tool schema is needed on any provider) instead of one flattened transcript. The newest `max_summary_images` images travel as real image parts to any route Hermes knows (or assumes) can read images; other routes, older images, binary documents and audio get named placeholders. Documents that already carry text are inlined (capped). An image rejection retries the same route with placeholders; a request-shape rejection retries once as flattened text.
 10. **File re-attachment** (v2.9): after compaction, the newest files read in the summarized history (up to `reattach_files`, default 5) are re-read from disk and appended to the summary, so the model sees their current contents without re-reading. Per-file cap `reattach_file_tokens` (5K) and total cap `reattach_total_tokens` (50K, never more than 15% of the trigger); larger files get a "use read_file" note. Files already read in the kept tail, secret-looking paths (`.env`, keys, `.ssh/`, `auth.json`, credentials) and binaries are skipped. The block is dropped before any preserved tail message would be trimmed.
 11. **Size-aware too-long retries** (v2.9): when the summarizer reports how far over the limit the request was ("N tokens > M", or "maximum context length is M ... requested N"), only enough of the oldest history to cover that gap plus 10% is moved to archive-only, instead of a fixed third. Up to 3 retries.
+12. **Trigger floor** (v2.9.1): compaction fires at **max(floor, min(cap, percent × window))**. The floor is the larger of `threshold_floor_tokens` and 1.5× the prompt size measured on the first response after a compaction (system prompt, tools, memory, summary and kept tail). A trigger below that floor would re-fire every turn; the floor stops it. A floor never pushes the trigger past 90% of the window.
 
 ## Install
 
@@ -48,6 +49,7 @@ compact-context:
   preserve_last_n: 6        # tail messages kept verbatim
   threshold_percent: 0.20   # trigger at 20% of context window (~200K on 1M model)
   threshold_tokens: 0       # fixed trigger in tokens; set BOTH knobs to fire at min(percent×window, fixed)
+  threshold_floor_tokens: 0 # trigger floor; 0 = learned only (1.5x the post-compaction prompt) (v2.9.1)
   transcript_enabled: true  # archive + pointer injection
   transcript_retain: 2      # newest N full archives + consolidated root; old paths become redirects (0 = keep all)
   model: ""                 # optional override; empty = Settings > Auxiliary > Compression, then the session model
@@ -77,7 +79,7 @@ compression:
 The summarizer guard measures the actual formatted request plus its output reserve. Tool output is shortened in that prompt; the full output remains in the archive. A request too large for every known summarizer window is skipped below the urgency line and routed to archive rescue when urgent. A post-compaction warning reports when the result still exceeds the configured trigger even though it fits the model budget.
 
 
-Trigger tuning: `threshold_tokens` alone = fixed mode (fires at exactly N tokens); `threshold_percent` alone = relative (default 0.20). Set **both** and they compose as **min()** — e.g. `threshold_percent: 0.8` + `threshold_tokens: 200000` fires at min(80% of window, 200K): ride the window on small models, but never past 200K on big ones. min() is always safely below the window (the percent is validated to 0.05–0.95), so it can never trip the overflow guard. A fixed-only value ≥ 95% of the context window can never fire in time, so it's ignored with a warning and the percent rule is used instead — re-checked on every model switch, since the window can change. The built-in `compression.threshold` config does NOT govern plugin engines.
+Trigger tuning: `threshold_tokens` alone = fixed mode (fires at exactly N tokens); `threshold_percent` alone = relative (default 0.20). Set **both** and they compose as **min()** — e.g. `threshold_percent: 0.8` + `threshold_tokens: 200000` fires at min(80% of window, 200K): ride the window on small models, but never past 200K on big ones. min() is always safely below the window (the percent is validated to 0.05–0.95), so it can never trip the overflow guard. A fixed-only value ≥ 95% of the context window can never fire in time, so it's ignored with a warning and the percent rule is used instead — re-checked on every model switch, since the window can change. The result is then raised to the floor: the full rule is max(floor, min(cap, percent × window)), with the floor learned from the first prompt measured after each compaction (or set with `threshold_floor_tokens`) and never above 90% of the window. The built-in `compression.threshold` config does NOT govern plugin engines.
 
 ## How it compares
 

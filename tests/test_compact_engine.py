@@ -1636,7 +1636,9 @@ def _check_rapid_refill():
         assert engine.should_compress(prompt_tokens=5000) is False, "breaker did not trip"
         assert engine.should_compress(prompt_tokens=9_600) is True, "breaker blocked the urgent rescue"
         for _ in range(mod.RAPID_REFILL_PROBE):
-            engine.update_from_response({"prompt_tokens": 5000})
+            # Post-compaction sample below the trigger: the learned floor
+            # (1.5x) stays under it, so this isolates the breaker re-probe.
+            engine.update_from_response({"prompt_tokens": 1000})
         assert engine.should_compress(prompt_tokens=5000) is True, "breaker never re-probes"
     with _review_case() as (engine, _):  # spaced compactions never trip it
         for _ in range(4):
@@ -1972,9 +1974,35 @@ def _check_reattach_hardening():
     assert not any(o.endswith("huge.log") for o in opened), "oversized file was opened"
     assert "`````\n" in block, "fence not longer than the content's backtick run"
 
+# 71. Trigger floor (v2.9.1): threshold = max(floor, min(cap, percent x
+# window)). Configured floor raises a low trigger; the learned floor (1.5x the
+# first prompt measured after a compaction) stops re-fire-every-turn; a floor
+# never passes 90% of the window; a floor below the trigger changes nothing.
+def _check_threshold_floor():
+    with _review_case(threshold_percent=0.2, threshold_floor_tokens=60_000) as (engine, _):
+        engine.update_model("m", 200_000)
+        assert engine.threshold_tokens == 60_000, engine.threshold_tokens
+    with _review_case(threshold_percent=0.2) as (engine, _):
+        engine.update_model("m", 200_000)
+        assert engine.threshold_tokens == 40_000, engine.threshold_tokens
+        engine._note_compaction_success(forced=False)
+        engine.update_from_response({"prompt_tokens": 50_000})
+        assert engine.threshold_tokens == 75_000, engine.threshold_tokens
+        assert not engine.should_compress(60_000), "re-fires below the learned floor"
+        engine.update_from_response({"prompt_tokens": 90_000})
+        assert engine.threshold_tokens == 75_000, "floor resampled outside the first response"
+    with _review_case(threshold_percent=0.2, threshold_floor_tokens=500_000) as (engine, _):
+        engine.update_model("m", 200_000)
+        assert engine.threshold_tokens == 180_000, engine.threshold_tokens
+    with _review_case(threshold_percent=0.8, threshold_tokens=300_000) as (engine, _):
+        engine.update_model("m", 1_000_000)
+        engine._note_compaction_success(forced=False)
+        engine.update_from_response({"prompt_tokens": 50_000})
+        assert engine.threshold_tokens == 300_000, engine.threshold_tokens
+
 _v29_failures = []
 for _number, _check in enumerate((_check_sized_reselection, _check_reattach, _check_reattach_limits,
-                                      _check_reattach_hardening), 67):
+                                      _check_reattach_hardening, _check_threshold_floor), 67):
     try:
         _check()
         print(f"[{_number}] {_check.__name__} passed")
@@ -1984,4 +2012,4 @@ for _number, _check in enumerate((_check_sized_reselection, _check_reattach, _ch
     finally:
         mod.call_llm = fake_call_llm
 assert not _v29_failures, "\n".join(_v29_failures)
-print("\nALL 70 CHECKS PASSED")
+print("\nALL 71 CHECKS PASSED")

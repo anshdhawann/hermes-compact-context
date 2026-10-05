@@ -16,6 +16,8 @@ each turn → should_compress(prompt_tokens)
   threshold_tokens = min(threshold_tokens_cfg, context_length × threshold_percent)  when both are explicitly configured
                   | threshold_tokens_cfg (fixed, compact-context.threshold_tokens)
                   | context_length × threshold_percent (default 0.20, compact-context.threshold_percent)
+  then threshold_tokens = max(floor, threshold_tokens), capped at 90% of the window (v2.9.1)
+  floor = max(threshold_floor_tokens, 1.5 × first prompt_tokens measured after a compaction)
   → compress(messages, current_tokens, focus_topic)
 session end → on_session_end(session_id, messages)
 ```

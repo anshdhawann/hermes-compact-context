@@ -41,6 +41,7 @@ Activate in config.yaml:
     model: ''                 # optional override; blank = Settings route
     provider: ''
     reasoning_effort: ''      # optional override; blank = Settings effort
+    threshold_floor_tokens: 0 # trigger floor; 0 = learned (1.5x post-compaction prompt)
 
 Summarizer route (v2.7): compact-context.model override (if set) ->
 Settings > Auxiliary > Compression (auxiliary.compression) -> the session's
@@ -213,6 +214,9 @@ DEFAULT_PRESERVE_FIRST_N = 3
 DEFAULT_PRESERVE_LAST_N = 6
 DEFAULT_THRESHOLD_PERCENT = 0.20
 DEFAULT_THRESHOLD_TOKENS = 0  # 0 = off; derive from threshold_percent instead
+DEFAULT_THRESHOLD_FLOOR_TOKENS = 0  # 0 = learned floor only (v2.9.1)
+FLOOR_HEADROOM = 1.5      # learned floor = post-compaction prompt size x this
+FLOOR_CEILING_SHARE = 0.90  # a floor never pushes the trigger past 90% of the window
 DEFAULT_TRANSCRIPT_RETAIN = 2
 TRANSCRIPT_GLOB = "compaction_transcript_*.jsonl"
 
@@ -881,6 +885,14 @@ class CompactEngine(ContextEngine):
         self.last_total_tokens: int = 0
         self.threshold_tokens: int = 0
         self.threshold_tokens_cfg: int = DEFAULT_THRESHOLD_TOKENS
+        # v2.9.1 floor: max(floor, min(cap, percent x window)). The floor is
+        # the larger of the configured value and 1.5x the prompt size measured
+        # on the first response after a compaction (system + tools + memory +
+        # summary + tail): a trigger below that re-fires every turn.
+        self.threshold_floor_cfg: int = DEFAULT_THRESHOLD_FLOOR_TOKENS
+        self._observed_floor: int = 0
+        self._await_floor_sample: bool = False
+        self._floor_clamp_logged: tuple = ()
         self._explicit_percent: bool = False
         self.context_length: int = context_length
         self.compression_count: int = 0
@@ -958,6 +970,30 @@ class CompactEngine(ContextEngine):
                     cfg, self.context_length, self.threshold_percent,
                 )
             self.threshold_tokens = pct
+        self._apply_floor()
+
+    def threshold_floor(self) -> int:
+        """Configured floor, or 1.5x the measured post-compaction prompt size."""
+        learned = int(self._observed_floor * FLOOR_HEADROOM) if self._observed_floor > 0 else 0
+        return max(self.threshold_floor_cfg, learned)
+
+    def _apply_floor(self) -> None:
+        """threshold = max(floor, min(cap, percent x window)), kept under 90%
+        of the window so normal compaction still fires before the 95% rescue."""
+        floor = self.threshold_floor()
+        if floor <= self.threshold_tokens:
+            return
+        ceiling = int(self.context_length * FLOOR_CEILING_SHARE)
+        raised = min(floor, ceiling)
+        if floor > ceiling and self._floor_clamp_logged != (floor, self.context_length):
+            logger.warning(
+                "Compact: floor %d is above 90%% of the window (%d); clamped to %d. "
+                "The baseline prompt nearly fills this model's context.",
+                floor, self.context_length, ceiling)
+            self._floor_clamp_logged = (floor, self.context_length)
+        if raised > self.threshold_tokens:
+            logger.info("Compact: trigger raised from %d to the floor %d", self.threshold_tokens, raised)
+            self.threshold_tokens = raised
 
     def _load_config(self):
         """Read compact-context-specific config from config.yaml.
@@ -999,6 +1035,7 @@ class CompactEngine(ContextEngine):
                 self.preserve_last_n = _int("preserve_last_n", DEFAULT_PRESERVE_LAST_N, lo=0, hi=10_000)
                 self.transcript_retain = _int("transcript_retain", DEFAULT_TRANSCRIPT_RETAIN, lo=0, hi=10_000)
                 self.threshold_tokens_cfg = _int("threshold_tokens", 0, lo=0)
+                self.threshold_floor_cfg = _int("threshold_floor_tokens", DEFAULT_THRESHOLD_FLOOR_TOKENS, lo=0)
                 self._summary_context_length = _int("summary_context_length", 0, lo=0, hi=100_000_000)
                 self.transcript_enabled = bool(compact_cfg.get("transcript_enabled", True))
                 self.transcript_dir = str(compact_cfg.get("transcript_dir", "") or "")
@@ -1107,8 +1144,8 @@ class CompactEngine(ContextEngine):
 
                 logger.info(
                     "Compact engine config: target_tokens=%d, preserve_first_n=%d, "
-                    "preserve_last_n=%d, threshold_percent=%.2f, threshold_tokens_cfg=%d "
-                    "(fires at %d tokens), "
+                    "preserve_last_n=%d, threshold_percent=%.2f, threshold_tokens_cfg=%d, "
+                    "floor=%d (fires at %d tokens), "
                     "transcript_enabled=%s, "
                     "summary_model=%s, summary_provider=%s, summary_window=%d, "
                     "settings_route=%s/%s, effort=%s (%s), microcompact=%s, "
@@ -1116,6 +1153,7 @@ class CompactEngine(ContextEngine):
                     self.target_tokens, self.protect_first_n,
                     self.preserve_last_n, self.threshold_percent,
                     self.threshold_tokens_cfg,
+                    self.threshold_floor(),
                     self.threshold_tokens,
                     self.transcript_enabled,
                     self._summary_model, self._summary_provider,
@@ -1183,6 +1221,12 @@ class CompactEngine(ContextEngine):
             self.last_prompt_tokens + self.last_completion_tokens
         )
         self._responses_since_compact += 1
+        # First real measurement after a compaction = the floor this session
+        # cannot compact below (system + tools + memory + summary + tail).
+        if self._await_floor_sample and self.last_prompt_tokens > 0:
+            self._await_floor_sample = False
+            self._observed_floor = int(self.last_prompt_tokens)
+            self._recompute_threshold()
 
     def should_compress(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> bool:
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -2019,6 +2063,7 @@ class CompactEngine(ContextEngine):
             else:
                 self._rapid_refills = 0
         self._responses_since_compact = 0
+        self._await_floor_sample = True
         self.compression_count += 1
 
     def _effective_target(self, body: List[Dict[str, Any]]) -> int:
